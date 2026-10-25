@@ -78,6 +78,8 @@ struct IndexMatch {
     score: f64,
     session_file: Option<PathBuf>,
     custom_title: Option<String>,
+    /// Set when the session lives outside the root `claude` reads by default
+    config_dir: Option<PathBuf>,
 }
 
 struct DeepMatch {
@@ -89,6 +91,8 @@ struct DeepMatch {
     summary: Option<String>,
     first_prompt: Option<String>,
     custom_title: Option<String>,
+    /// Set when the session lives outside the root `claude` reads by default
+    config_dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -192,6 +196,36 @@ fn claude_projects_dirs() -> Vec<PathBuf> {
     }
 
     roots
+}
+
+/// Config root to pass as CLAUDE_CONFIG_DIR when resuming a session found
+/// under `projects_dir`, or None if `claude` already reads that root.
+///
+/// `claude -r` only looks in its own config root ($CLAUDE_CONFIG_DIR, else
+/// ~/.claude), so a session from any other root needs the override.
+fn resume_config_dir(projects_dir: &Path) -> Option<PathBuf> {
+    let root = projects_dir.parent()?;
+    let default = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => dirs::home_dir()?.join(".claude"),
+    };
+    let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canonical(root) == canonical(&default) {
+        None
+    } else {
+        Some(root.to_path_buf())
+    }
+}
+
+/// The copy-pasteable resume command printed under each Claude Code result
+fn resume_command(project_short: &str, session_id: &str, config_dir: Option<&Path>) -> String {
+    match config_dir {
+        Some(dir) => format!(
+            "cd {project_short} && CLAUDE_CONFIG_DIR={} claude -r {session_id}",
+            format_project_path(&dir.to_string_lossy())
+        ),
+        None => format!("cd {project_short} && claude -r {session_id}"),
+    }
 }
 
 /// Drop hits for a session already reported from a different config root.
@@ -567,6 +601,7 @@ fn search_index(
                     score,
                     session_file: index_session_file(&index_path, &entry.session_id),
                     custom_title: None,
+                    config_dir: None,
                 });
             }
         }
@@ -1129,6 +1164,7 @@ fn search_deep_claude_rust(
                 summary: index_entry.map(|e| e.summary.clone()),
                 first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
                 custom_title: cached_custom_title(&mut titles, &file_path),
+                config_dir: None,
             });
 
             *count += 1;
@@ -1229,6 +1265,7 @@ fn search_deep_openclaw_rust(
                 summary: None,
                 first_prompt: None,
                 custom_title: None,
+                config_dir: None,
             });
 
             *count += 1;
@@ -1366,6 +1403,7 @@ fn search_deep_claude(
             summary: index_entry.map(|e| e.summary.clone()),
             first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
             custom_title: cached_custom_title(&mut titles, &path),
+            config_dir: None,
         });
 
         *count += 1;
@@ -1498,6 +1536,7 @@ fn search_deep_openclaw(
             summary: None,
             first_prompt: None,
             custom_title: None,
+            config_dir: None,
         });
 
         *count += 1;
@@ -1759,8 +1798,8 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
         println!("      Session:  {}", m.session_id);
         // Print copy-pasteable resume command
         println!(
-            "      Resume:   cd {} && claude -r {}",
-            project_short, m.session_id
+            "      Resume:   {}",
+            resume_command(&project_short, &m.session_id, m.config_dir.as_deref())
         );
         println!();
     }
@@ -1822,8 +1861,8 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
         // Print copy-pasteable resume command (Claude Code only, not OpenClaw)
         if !is_openclaw && m.project_path != "unknown" {
             println!(
-                "      Resume:   cd {} && claude -r {}",
-                project_short, m.session_id
+                "      Resume:   {}",
+                resume_command(&project_short, &m.session_id, m.config_dir.as_deref())
             );
         }
         println!();
@@ -1947,8 +1986,13 @@ fn main() {
             let mut per_root: Vec<std::vec::IntoIter<DeepMatch>> = bases
                 .iter()
                 .map(|base| {
-                    search_deep_claude(&query, cli.limit, project_filter, base, &date_range)
-                        .into_iter()
+                    let config_dir = resume_config_dir(base);
+                    let mut hits =
+                        search_deep_claude(&query, cli.limit, project_filter, base, &date_range);
+                    for hit in &mut hits {
+                        hit.config_dir.clone_from(&config_dir);
+                    }
+                    hits.into_iter()
                 })
                 .collect();
             // Deep matches carry no comparable score (ripgrep returns file
@@ -1974,10 +2018,14 @@ fn main() {
         } else {
             let mut merged = Vec::new();
             for (root, base) in bases.iter().enumerate() {
+                let config_dir = resume_config_dir(base);
                 merged.extend(
                     search_index(&query, project_filter, base, &date_range)
                         .into_iter()
-                        .map(|m| (root, m)),
+                        .map(|mut m| {
+                            m.config_dir.clone_from(&config_dir);
+                            (root, m)
+                        }),
                 );
             }
             // Each root sorted its own results; re-sort so the merged list is

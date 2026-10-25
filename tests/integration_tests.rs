@@ -29,8 +29,11 @@ mod multi_config_root {
     fn write_session(root: &std::path::Path, project: &str, session: &str, text: &str) {
         let dir = root.join("projects").join(project);
         fs::create_dir_all(&dir).expect("create project dir");
+        // cwd encodes to the project dir name, so deep hits get a Resume line
+        let cwd = format!("/home/user/{}", project.trim_start_matches("-home-user-"));
         let line = format!(
             "{{\"type\":\"user\",\"sessionId\":\"{session}\",\
+             \"cwd\":\"{cwd}\",\
              \"timestamp\":\"2026-02-01T10:00:00Z\",\
              \"message\":{{\"role\":\"user\",\"content\":\
              [{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
@@ -58,13 +61,33 @@ mod multi_config_root {
     }
 
     fn search(home: &std::path::Path, args: &[&str]) -> String {
-        let output = Command::new(binary_path())
-            .args(args)
-            .env("HOME", home)
-            .env_remove("CLAUDE_CONFIG_DIR")
-            .output()
-            .expect("Failed to run binary");
+        search_with_config_dir(home, None, args)
+    }
+
+    fn search_with_config_dir(
+        home: &std::path::Path,
+        config_dir: Option<&std::path::Path>,
+        args: &[&str],
+    ) -> String {
+        let mut cmd = Command::new(binary_path());
+        cmd.args(args).env("HOME", home);
+        match config_dir {
+            Some(dir) => cmd.env("CLAUDE_CONFIG_DIR", dir),
+            None => cmd.env_remove("CLAUDE_CONFIG_DIR"),
+        };
+        let output = cmd.output().expect("Failed to run binary");
+        assert!(output.status.success(), "binary failed: {output:?}");
         String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    /// The `Resume:` line printed for `session_id`
+    fn resume_for(stdout: &str, session_id: &str) -> String {
+        stdout
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("Resume:") && l.ends_with(session_id))
+            .unwrap_or_else(|| panic!("no Resume line for {session_id}:\n{stdout}"))
+            .to_string()
     }
 
     #[test]
@@ -196,6 +219,100 @@ mod multi_config_root {
             hits_for(&index, "33333333-3333-3333-3333-333333333333"),
             1,
             "index search must report a session once across roots:\n{index}"
+        );
+    }
+
+    #[test]
+    fn resume_command_targets_the_root_the_session_came_from() {
+        ensure_binary_built();
+        let home = fake_home();
+        write_index(
+            &home.path().join(".claude"),
+            "-home-user-personal",
+            "11111111-1111-1111-1111-111111111111",
+            "zebrafish migration plan",
+        );
+        write_index(
+            &home.path().join(".claude-work"),
+            "-home-user-work-api",
+            "22222222-2222-2222-2222-222222222222",
+            "zebrafish migration plan",
+        );
+
+        for args in [
+            &["zebrafish", "--limit", "10"][..],
+            &["zebrafish", "--deep", "--limit", "10"][..],
+        ] {
+            let stdout = search(home.path(), args);
+            let personal = resume_for(&stdout, "11111111-1111-1111-1111-111111111111");
+            assert!(
+                personal.contains("&& claude -r ") && !personal.contains("CLAUDE_CONFIG_DIR"),
+                "the default root needs no override, got: {personal}"
+            );
+            assert!(
+                resume_for(&stdout, "22222222-2222-2222-2222-222222222222")
+                    .contains("&& CLAUDE_CONFIG_DIR=~/.claude-work claude -r "),
+                "a work-root session must resume with its own config dir:\n{stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_config_dir_outside_home_is_searched_and_resumed_without_override() {
+        ensure_binary_built();
+        let home = fake_home();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        write_session(
+            elsewhere.path(),
+            "-home-user-ops",
+            "44444444-4444-4444-4444-444444444444",
+            "ops transcript about zebrafish migration",
+        );
+
+        let stdout = search_with_config_dir(
+            home.path(),
+            Some(elsewhere.path()),
+            &["zebrafish", "--deep"],
+        );
+
+        for id in [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ] {
+            assert_eq!(hits_for(&stdout, id), 1, "missing {id}:\n{stdout}");
+        }
+        assert_eq!(
+            hits_for(&stdout, "44444444-4444-4444-4444-444444444444"),
+            1,
+            "CLAUDE_CONFIG_DIR outside $HOME must be searched:\n{stdout}"
+        );
+        let configured = resume_for(&stdout, "44444444-4444-4444-4444-444444444444");
+        assert!(
+            !configured.contains("CLAUDE_CONFIG_DIR"),
+            "claude already reads $CLAUDE_CONFIG_DIR, got: {configured}"
+        );
+        assert!(
+            resume_for(&stdout, "11111111-1111-1111-1111-111111111111")
+                .contains("CLAUDE_CONFIG_DIR=~/.claude claude -r "),
+            "with CLAUDE_CONFIG_DIR set elsewhere, ~/.claude needs an override:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_pointing_at_a_home_root_is_not_searched_twice() {
+        ensure_binary_built();
+        let home = fake_home();
+        let stdout = search_with_config_dir(
+            home.path(),
+            // Non-canonical spelling of ~/.claude-work
+            Some(&home.path().join(".claude").join("..").join(".claude-work")),
+            &["zebrafish", "--deep"],
+        );
+
+        assert_eq!(
+            hits_for(&stdout, "22222222-2222-2222-2222-222222222222"),
+            1,
+            "{stdout}"
         );
     }
 }
