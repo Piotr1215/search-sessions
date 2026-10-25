@@ -168,7 +168,12 @@ fn claude_projects_dirs() -> Vec<PathBuf> {
     if let Some(configured) = std::env::var_os("CLAUDE_CONFIG_DIR")
         && !configured.is_empty()
     {
-        push(PathBuf::from(configured).join("projects"));
+        let configured = PathBuf::from(configured);
+        push(
+            std::path::absolute(&configured)
+                .unwrap_or(configured)
+                .join("projects"),
+        );
     }
 
     if let Some(home) = dirs::home_dir() {
@@ -206,6 +211,11 @@ fn claude_projects_dirs() -> Vec<PathBuf> {
 fn resume_config_dir(projects_dir: &Path) -> Option<PathBuf> {
     let root = projects_dir.parent()?;
     let default = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        // The resume command cds into the project first, which would make a
+        // relative CLAUDE_CONFIG_DIR point somewhere else; spell it out.
+        Some(dir) if !dir.is_empty() && Path::new(&dir).is_relative() => {
+            return Some(root.to_path_buf());
+        }
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => dirs::home_dir()?.join(".claude"),
     };

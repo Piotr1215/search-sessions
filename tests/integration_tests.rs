@@ -617,6 +617,40 @@ mod multi_config_root {
             "resume must continue the live ~/.claude copy, got: {resume}"
         );
     }
+
+    #[test]
+    fn a_relative_claude_config_dir_is_spelled_out_in_the_resume_command() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let id = "efefefef-efef-efef-efef-efefefefefef";
+        write_session(
+            &cwd.path().join("cfg"),
+            "-home-user-rel",
+            id,
+            "relative transcript about zebrafish migration",
+        );
+
+        let output = Command::new(binary_path())
+            .args(["zebrafish", "--deep"])
+            .current_dir(cwd.path())
+            .env("HOME", home.path())
+            .env("CLAUDE_CONFIG_DIR", "cfg")
+            .output()
+            .expect("Failed to run binary");
+        assert!(output.status.success(), "binary failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // `cd` runs first, so a bare `cfg` would no longer resolve
+        let absolute = fs::canonicalize(cwd.path()).unwrap().join("cfg");
+        assert!(
+            resume_for(&stdout, id).contains(&format!(
+                "CLAUDE_CONFIG_DIR={} claude -r ",
+                absolute.display()
+            )),
+            "{stdout}"
+        );
+    }
 }
 
 mod index_parsing {
