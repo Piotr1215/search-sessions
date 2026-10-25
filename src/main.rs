@@ -2118,6 +2118,15 @@ fn main() {
             bases.iter().map(|base| resume_config_dir(base)).collect();
 
         if cli.deep {
+            if let Some(filter) = project_filter
+                && bases
+                    .iter()
+                    .all(|base| resolve_search_paths(base, Some(filter)).is_empty())
+            {
+                eprintln!(
+                    "NOTE: --project {filter:?} matched no project directory in any config root."
+                );
+            }
             let found: Vec<(usize, DeepMatch)> = bases
                 .iter()
                 .enumerate()
