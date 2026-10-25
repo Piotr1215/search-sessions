@@ -400,6 +400,115 @@ mod multi_config_root {
         }
     }
 
+    /// Backdate a transcript so another root's copy counts as the live one
+    fn backdate(path: &std::path::Path) {
+        let day_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(day_ago))
+            .expect("backdate transcript");
+    }
+
+    /// A live session with an older copy in ~/.claude.bak, plus one session
+    /// only the backup has.
+    fn home_with_stale_backup(shared_text: &str) -> tempfile::TempDir {
+        let home = fake_home();
+        let shared = "88888888-8888-8888-8888-888888888888";
+        for root in [".claude", ".claude.bak"] {
+            write_session(
+                &home.path().join(root),
+                "-home-user-shared",
+                shared,
+                shared_text,
+            );
+        }
+        backdate(
+            &home
+                .path()
+                .join(".claude.bak/projects/-home-user-shared")
+                .join(format!("{shared}.jsonl")),
+        );
+        write_session(
+            &home.path().join(".claude.bak"),
+            "-home-user-shared",
+            "99999999-9999-9999-9999-999999999999",
+            "only in the backup: zebrafish migration",
+        );
+        home
+    }
+
+    #[test]
+    fn a_stale_backup_does_not_take_over_a_live_session() {
+        ensure_binary_built();
+        // ~/.claude-backup is searched before ~/.claude-work and holds only
+        // the stale copy, so it reaches the session first whatever order
+        // the files are read in. The newer copy must still win.
+        let home = tempfile::tempdir().expect("tempdir");
+        let shared = "88888888-8888-8888-8888-888888888888";
+        for root in [".claude-backup", ".claude-work"] {
+            write_session(
+                &home.path().join(root),
+                "-home-user-shared",
+                shared,
+                "shared transcript about zebrafish migration",
+            );
+            write_index(
+                &home.path().join(root),
+                "-home-user-shared",
+                shared,
+                "zebrafish migration plan",
+            );
+        }
+        backdate(
+            &home
+                .path()
+                .join(".claude-backup/projects/-home-user-shared")
+                .join(format!("{shared}.jsonl")),
+        );
+
+        for args in [
+            &["zebrafish", "--limit", "10"][..],
+            &["zebrafish", "--deep", "--limit", "10"][..],
+        ] {
+            let stdout = search(home.path(), args);
+            assert_eq!(hits_for(&stdout, shared), 1, "{stdout}");
+            let resume = resume_for(&stdout, shared);
+            assert!(
+                resume.contains("CLAUDE_CONFIG_DIR=$HOME/.claude-work claude -r "),
+                "the newer copy must own the session, got: {resume}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_backup_copies_do_not_use_up_the_backup_roots_limit() {
+        ensure_binary_built();
+        let home = home_with_stale_backup("shared transcript about zebrafish migration");
+        let shared_file = |root: &str| {
+            home.path()
+                .join(root)
+                .join("projects/-home-user-shared/88888888-8888-8888-8888-888888888888.jsonl")
+        };
+        // Two matching lines, so the stale copy alone could fill --limit 2
+        for root in [".claude", ".claude.bak"] {
+            let line = fs::read_to_string(shared_file(root)).unwrap();
+            fs::write(shared_file(root), format!("{line}{line}")).unwrap();
+        }
+        backdate(&shared_file(".claude.bak"));
+
+        let stdout = search(
+            home.path(),
+            &["zebrafish", "--deep", "--project", "shared", "--limit", "2"],
+        );
+
+        assert_eq!(
+            hits_for(&stdout, "99999999-9999-9999-9999-999999999999"),
+            1,
+            "the backup's own session must not be crowded out by its stale copy:\n{stdout}"
+        );
+    }
+
     #[test]
     fn resume_command_quotes_a_config_dir_with_a_space() {
         ensure_binary_built();

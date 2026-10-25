@@ -252,9 +252,60 @@ fn shell_path(path: &Path) -> String {
     quote(&path)
 }
 
+/// For each session with a transcript in more than one config root, the
+/// index of the root that owns it: the one whose copy was modified last,
+/// ties going to the earlier (higher-priority) root.
+///
+/// A backup or copied root (~/.claude.bak) holds stale copies of live
+/// sessions. Hits from a non-owning root are skipped during the search, so
+/// they neither use up that root's --limit nor print a Resume command that
+/// would continue the conversation inside the backup.
+fn session_owners(bases: &[PathBuf]) -> HashMap<String, usize> {
+    if bases.len() < 2 {
+        return HashMap::new();
+    }
+    let mut newest: HashMap<String, (usize, std::time::SystemTime)> = HashMap::new();
+    let mut roots_seen: HashMap<String, usize> = HashMap::new();
+    for (root, base) in bases.iter().enumerate() {
+        let Ok(projects) = fs::read_dir(base) else {
+            continue;
+        };
+        for project in projects.flatten() {
+            let Ok(files) = fs::read_dir(project.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().is_none_or(|e| e != "jsonl") {
+                    continue;
+                }
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let modified = file
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                *roots_seen.entry(id.to_string()).or_insert(0) += 1;
+                match newest.get(id) {
+                    Some(&(_, best)) if best >= modified => {}
+                    _ => {
+                        newest.insert(id.to_string(), (root, modified));
+                    }
+                }
+            }
+        }
+    }
+    newest
+        .into_iter()
+        .filter(|(id, _)| roots_seen.get(id).is_some_and(|&n| n > 1))
+        .map(|(id, (root, _))| (id, root))
+        .collect()
+}
+
 /// Drop hits for a session already reported from a different config root.
-/// A backup or copied root (~/.claude.bak) holds the same sessions, so
-/// without this each one would be printed once per root.
+/// Backstop for sessions `session_owners` can't place (a transcript not
+/// named after its session ID).
 fn dedupe_sessions_across_roots<T>(
     hits: Vec<(usize, T)>,
     session_id: impl Fn(&T) -> &str,
@@ -1093,6 +1144,7 @@ fn search_deep_claude_rust(
     project_filter: Option<&str>,
     base: &Path,
     date_range: &DateRange,
+    owned: &dyn Fn(&str) -> bool,
 ) -> Vec<DeepMatch> {
     warn_ripgrep_not_available();
 
@@ -1142,6 +1194,10 @@ fn search_deep_claude_rust(
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
+
+            if !owned(&session_id) {
+                continue;
+            }
 
             let count = seen_sessions.entry(session_id.clone()).or_insert(0);
             if *count >= MAX_MATCHES_PER_SESSION {
@@ -1299,16 +1355,19 @@ fn search_deep_openclaw_rust(
     matches
 }
 
+/// `owned` says whether this root owns a session ID; hits for sessions owned
+/// by another config root are skipped and don't count toward `limit`.
 fn search_deep_claude(
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
     base: &Path,
     date_range: &DateRange,
+    owned: &dyn Fn(&str) -> bool,
 ) -> Vec<DeepMatch> {
     // Check if ripgrep is available, fall back to pure Rust if not
     if !is_ripgrep_available() {
-        return search_deep_claude_rust(query, limit, project_filter, base, date_range);
+        return search_deep_claude_rust(query, limit, project_filter, base, date_range, owned);
     }
 
     let search_paths = resolve_search_paths(base, project_filter);
@@ -1341,7 +1400,7 @@ fn search_deep_claude(
         Err(e) => {
             // Fallback to Rust if ripgrep fails unexpectedly
             eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback.");
-            return search_deep_claude_rust(query, limit, project_filter, base, date_range);
+            return search_deep_claude_rust(query, limit, project_filter, base, date_range, owned);
         }
     };
 
@@ -1380,6 +1439,10 @@ fn search_deep_claude(
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string();
+
+        if !owned(&session_id) {
+            continue;
+        }
 
         let count = seen_sessions.entry(session_id.clone()).or_insert(0);
         if *count >= MAX_MATCHES_PER_SESSION {
@@ -2007,14 +2070,26 @@ fn main() {
         }
 
         let project_filter = cli.project.as_deref();
+        let owners = session_owners(&bases);
+        let owned_by = |root: usize| {
+            let owners = &owners;
+            move |id: &str| owners.get(id).is_none_or(|&owner| owner == root)
+        };
 
         if cli.deep {
             let mut per_root: Vec<std::vec::IntoIter<DeepMatch>> = bases
                 .iter()
-                .map(|base| {
+                .enumerate()
+                .map(|(root, base)| {
                     let config_dir = resume_config_dir(base);
-                    let mut hits =
-                        search_deep_claude(&query, cli.limit, project_filter, base, &date_range);
+                    let mut hits = search_deep_claude(
+                        &query,
+                        cli.limit,
+                        project_filter,
+                        base,
+                        &date_range,
+                        &owned_by(root),
+                    );
                     for hit in &mut hits {
                         hit.config_dir.clone_from(&config_dir);
                     }
@@ -2048,6 +2123,7 @@ fn main() {
                 merged.extend(
                     search_index(&query, project_filter, base, &date_range)
                         .into_iter()
+                        .filter(|m| owned_by(root)(&m.session_id))
                         .map(|mut m| {
                             m.config_dir.clone_from(&config_dir);
                             (root, m)
