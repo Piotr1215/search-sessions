@@ -118,6 +118,86 @@ mod multi_config_root {
              match must be skipped, not searched wholesale:\n{stdout}"
         );
     }
+
+    /// Number of results printed for `session_id` (one `Session:` line each)
+    fn hits_for(stdout: &str, session_id: &str) -> usize {
+        stdout
+            .lines()
+            .filter(|l| l.trim() == format!("Session:  {session_id}"))
+            .count()
+    }
+
+    fn write_index(root: &std::path::Path, project: &str, session: &str, summary: &str) {
+        let dir = root.join("projects").join(project);
+        fs::create_dir_all(&dir).expect("create project dir");
+        let index = serde_json::json!({
+            "originalPath": format!("/home/user/{project}"),
+            "entries": [{
+                "sessionId": session,
+                "firstPrompt": summary,
+                "summary": summary,
+                "messageCount": 1,
+                "created": "2026-02-01T10:00:00Z",
+                "modified": "2026-02-01T10:00:00Z",
+                "projectPath": format!("/home/user/{project}"),
+            }],
+        });
+        fs::write(dir.join("sessions-index.json"), index.to_string()).expect("write index");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_searched_once() {
+        ensure_binary_built();
+        let home = fake_home();
+        std::os::unix::fs::symlink(
+            home.path().join(".claude"),
+            home.path().join(".claude-current"),
+        )
+        .expect("symlink root");
+
+        let stdout = search(home.path(), &["zebrafish", "--deep", "--limit", "10"]);
+
+        assert_eq!(
+            hits_for(&stdout, "11111111-1111-1111-1111-111111111111"),
+            1,
+            "a symlinked alias of ~/.claude must not double its hits:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn a_backup_root_does_not_duplicate_sessions() {
+        ensure_binary_built();
+        let home = fake_home();
+        for root in [".claude", ".claude.bak"] {
+            write_session(
+                &home.path().join(root),
+                "-home-user-personal",
+                "33333333-3333-3333-3333-333333333333",
+                "backed up transcript about axolotl",
+            );
+            write_index(
+                &home.path().join(root),
+                "-home-user-personal",
+                "33333333-3333-3333-3333-333333333333",
+                "axolotl tank setup",
+            );
+        }
+
+        let deep = search(home.path(), &["axolotl", "--deep", "--limit", "10"]);
+        assert_eq!(
+            hits_for(&deep, "33333333-3333-3333-3333-333333333333"),
+            1,
+            "deep search must report a session once across roots:\n{deep}"
+        );
+
+        let index = search(home.path(), &["axolotl", "--limit", "10"]);
+        assert_eq!(
+            hits_for(&index, "33333333-3333-3333-3333-333333333333"),
+            1,
+            "index search must report a session once across roots:\n{index}"
+        );
+    }
 }
 
 mod index_parsing {

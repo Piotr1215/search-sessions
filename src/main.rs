@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -151,8 +151,12 @@ struct ObsidianMatch {
 /// outside the home directory.
 fn claude_projects_dirs() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
+    // Dedupe on the canonical path: a symlinked root (~/.claude-current ->
+    // ~/.claude) or a non-canonical CLAUDE_CONFIG_DIR would otherwise scan
+    // the same tree twice and print every hit twice.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut push = |dir: PathBuf| {
-        if dir.is_dir() && !roots.contains(&dir) {
+        if dir.is_dir() && seen.insert(fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())) {
             roots.push(dir);
         }
     };
@@ -188,6 +192,23 @@ fn claude_projects_dirs() -> Vec<PathBuf> {
     }
 
     roots
+}
+
+/// Drop hits for a session already reported from a different config root.
+/// A backup or copied root (~/.claude.bak) holds the same sessions, so
+/// without this each one would be printed once per root.
+fn dedupe_sessions_across_roots<T>(
+    hits: Vec<(usize, T)>,
+    session_id: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    hits.into_iter()
+        .filter(|(root, hit)| {
+            let id = session_id(hit);
+            id.is_empty() || *owner.entry(id.to_string()).or_insert(*root) == *root
+        })
+        .map(|(_, hit)| hit)
+        .collect()
 }
 
 fn openclaw_sessions_dir(agent: &str) -> PathBuf {
@@ -1935,12 +1956,12 @@ fn main() {
             // whole limit and hide every other account. Round-robin instead, so
             // a low --limit shows a spread across accounts rather than only the
             // alphabetically-first one.
-            let mut matches = Vec::new();
+            let mut merged = Vec::new();
             loop {
                 let mut progressed = false;
-                for root in per_root.iter_mut() {
-                    if let Some(hit) = root.next() {
-                        matches.push(hit);
+                for (root, hits) in per_root.iter_mut().enumerate() {
+                    if let Some(hit) = hits.next() {
+                        merged.push((root, hit));
                         progressed = true;
                     }
                 }
@@ -1948,20 +1969,26 @@ fn main() {
                     break;
                 }
             }
+            let matches = dedupe_sessions_across_roots(merged, |m| &m.session_id);
             print_deep_results(&matches, &query, cli.limit, false);
         } else {
-            let mut matches = Vec::new();
-            for base in &bases {
-                matches.extend(search_index(&query, project_filter, base, &date_range));
+            let mut merged = Vec::new();
+            for (root, base) in bases.iter().enumerate() {
+                merged.extend(
+                    search_index(&query, project_filter, base, &date_range)
+                        .into_iter()
+                        .map(|m| (root, m)),
+                );
             }
             // Each root sorted its own results; re-sort so the merged list is
             // ranked globally rather than grouped by which root it came from.
-            matches.sort_by(|a, b| {
+            merged.sort_by(|(_, a), (_, b)| {
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| b.modified.cmp(&a.modified))
             });
+            let mut matches = dedupe_sessions_across_roots(merged, |m| &m.session_id);
             // Titles live in the transcripts, so only read them for displayed results
             for m in matches.iter_mut().take(cli.limit) {
                 if let Some(path) = &m.session_file {
