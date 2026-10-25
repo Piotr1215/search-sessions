@@ -236,10 +236,11 @@ fn resume_command(project_short: &str, session_id: &str, config_dir: Option<&Pat
     };
     match config_dir {
         Some(dir) => format!(
-            "cd {cd} && CLAUDE_CONFIG_DIR={} claude -r {session_id}",
-            shell_path(dir)
+            "cd {cd} && CLAUDE_CONFIG_DIR={} claude -r {}",
+            shell_path(dir),
+            shell_quote(session_id)
         ),
-        None => format!("cd {cd} && claude -r {session_id}"),
+        None => format!("cd {cd} && claude -r {}", shell_quote(session_id)),
     }
 }
 
@@ -2012,10 +2013,12 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
         }
         println!("      Session:  {}", m.session_id);
         // Print copy-pasteable resume command
-        println!(
-            "      Resume:   {}",
-            resume_command(&project_short, &m.session_id, m.config_dir.as_deref())
-        );
+        if !m.session_id.is_empty() {
+            println!(
+                "      Resume:   {}",
+                resume_command(&project_short, &m.session_id, m.config_dir.as_deref())
+            );
+        }
         println!();
     }
 
@@ -2074,7 +2077,7 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
         println!("      Snippet:  {clean_snippet}");
         println!("      Session:  {}", m.session_id);
         // Print copy-pasteable resume command (Claude Code only, not OpenClaw)
-        if !is_openclaw && m.project_path != "unknown" {
+        if !is_openclaw && m.project_path != "unknown" && !m.session_id.is_empty() {
             println!(
                 "      Resume:   {}",
                 resume_command(&project_short, &m.session_id, m.config_dir.as_deref())

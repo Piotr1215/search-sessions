@@ -801,6 +801,25 @@ mod multi_config_root {
 
         assert!(stdout.contains("Label:    Live title"), "{stdout}");
     }
+
+    #[test]
+    fn resume_command_quotes_an_odd_session_id() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        write_index(
+            &home.path().join(".claude"),
+            "-home-user-odd",
+            "odd;id",
+            "zebrafish plan",
+        );
+
+        let stdout = search(home.path(), &["zebrafish"]);
+
+        assert!(
+            stdout.contains("&& claude -r 'odd;id'"),
+            "a session ID with shell syntax must be quoted:\n{stdout}"
+        );
+    }
 }
 
 mod index_parsing {
