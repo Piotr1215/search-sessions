@@ -671,6 +671,35 @@ mod multi_config_root {
             "{stdout}"
         );
     }
+
+    #[test]
+    fn a_stale_index_entry_resumes_the_root_that_has_the_transcript() {
+        ensure_binary_built();
+        // Only the backup's index lists the session; only ~/.claude still
+        // has its transcript, so that is where claude can resume it.
+        let home = tempfile::tempdir().expect("tempdir");
+        let id = "5a5a5a5a-5a5a-5a5a-5a5a-5a5a5a5a5a5a";
+        write_index(
+            &home.path().join(".claude.bak"),
+            "-home-user-moved",
+            id,
+            "axolotl tank setup",
+        );
+        write_session(
+            &home.path().join(".claude"),
+            "-home-user-moved",
+            id,
+            "the only transcript",
+        );
+
+        let stdout = search(home.path(), &["axolotl"]);
+
+        let resume = resume_for(&stdout, id);
+        assert!(
+            !resume.contains("CLAUDE_CONFIG_DIR"),
+            "resume must target the root holding the transcript, got: {resume}"
+        );
+    }
 }
 
 mod index_parsing {

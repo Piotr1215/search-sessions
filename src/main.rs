@@ -283,12 +283,15 @@ fn session_owner(copies: &[(usize, u64)]) -> Option<usize> {
         .map(|&(root, _)| root)
 }
 
-/// Owners of sessions with a transcript in more than one config root.
+/// Owner of every session with a transcript in any config root, for deep
+/// search, which needs them before it searches.
 ///
 /// Ownership never hides a match: it decides which root's hits are shown
 /// when several roots match the same session, and which root the Resume
 /// command targets, so resuming continues the live copy rather than a
-/// backup's. Only sessions found in more than one root are stat'ed.
+/// backup's. A session with a single transcript is owned by its root even
+/// if another root's stale index still lists it. Only sessions found in
+/// more than one root are stat'ed.
 fn session_owners(bases: &[PathBuf]) -> HashMap<String, usize> {
     if bases.len() < 2 {
         return HashMap::new();
@@ -316,15 +319,56 @@ fn session_owners(bases: &[PathBuf]) -> HashMap<String, usize> {
     }
     copies
         .into_iter()
-        .filter(|(_, c)| c.iter().any(|(root, _)| *root != c[0].0))
         .filter_map(|(id, c)| {
-            let lens: Vec<(usize, u64)> = c
-                .iter()
-                .map(|(root, path)| (*root, fs::metadata(path).map_or(0, |m| m.len())))
-                .collect();
-            session_owner(&lens).map(|root| (id, root))
+            let owner = if c.iter().all(|(root, _)| *root == c[0].0) {
+                Some(c[0].0)
+            } else {
+                let lens: Vec<(usize, u64)> = c
+                    .iter()
+                    .map(|(root, path)| (*root, fs::metadata(path).map_or(0, |m| m.len())))
+                    .collect();
+                session_owner(&lens)
+            };
+            owner.map(|root| (id, root))
         })
         .collect()
+}
+
+/// Owners of just the sessions index search matched. Each hit names its
+/// transcript, and a copied root keeps the same project dir name, so this
+/// checks that one path in every root instead of walking them all.
+fn index_owners(bases: &[PathBuf], hits: &[(usize, IndexMatch)]) -> HashMap<String, usize> {
+    if bases.len() < 2 {
+        return HashMap::new();
+    }
+    let mut owners = HashMap::new();
+    for (_, hit) in hits {
+        if owners.contains_key(&hit.session_id) {
+            continue;
+        }
+        let Some(project) = hit
+            .session_file
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+        else {
+            continue;
+        };
+        let file_name = format!("{}.jsonl", hit.session_id);
+        let copies: Vec<(usize, u64)> = bases
+            .iter()
+            .enumerate()
+            .filter_map(|(root, base)| {
+                fs::metadata(base.join(project).join(&file_name))
+                    .ok()
+                    .map(|m| (root, m.len()))
+            })
+            .collect();
+        if let Some(owner) = session_owner(&copies) {
+            owners.insert(hit.session_id.clone(), owner);
+        }
+    }
+    owners
 }
 
 /// Keep one root's hits per session: the owner's if the owner matched,
@@ -2113,11 +2157,11 @@ fn main() {
         }
 
         let project_filter = cli.project.as_deref();
-        let owners = session_owners(&bases);
         let resume_dirs: Vec<Option<PathBuf>> =
             bases.iter().map(|base| resume_config_dir(base)).collect();
 
         if cli.deep {
+            let owners = session_owners(&bases);
             if let Some(filter) = project_filter
                 && bases
                     .iter()
@@ -2187,6 +2231,7 @@ fn main() {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| b.modified.cmp(&a.modified))
             });
+            let owners = index_owners(&bases, &merged);
             let mut matches: Vec<IndexMatch> = pick_session_hits(
                 merged,
                 |m| &m.session_id,
