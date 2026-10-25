@@ -229,12 +229,16 @@ fn resume_config_dir(projects_dir: &Path) -> Option<PathBuf> {
 
 /// The copy-pasteable resume command printed under each Claude Code result
 fn resume_command(project_short: &str, session_id: &str, config_dir: Option<&Path>) -> String {
+    let cd = match project_short.strip_prefix("~/") {
+        Some(rest) => format!("~/{}", shell_quote(rest)),
+        None => shell_quote(project_short),
+    };
     match config_dir {
         Some(dir) => format!(
-            "cd {project_short} && CLAUDE_CONFIG_DIR={} claude -r {session_id}",
+            "cd {cd} && CLAUDE_CONFIG_DIR={} claude -r {session_id}",
             shell_path(dir)
         ),
-        None => format!("cd {project_short} && claude -r {session_id}"),
+        None => format!("cd {cd} && claude -r {session_id}"),
     }
 }
 

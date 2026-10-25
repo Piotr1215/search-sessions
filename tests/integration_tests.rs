@@ -651,6 +651,26 @@ mod multi_config_root {
             "{stdout}"
         );
     }
+
+    #[test]
+    fn resume_command_quotes_a_project_dir_with_a_space() {
+        ensure_binary_built();
+        let home = fake_home();
+        write_index(
+            &home.path().join(".claude"),
+            "my app",
+            "3c3c3c3c-3c3c-3c3c-3c3c-3c3c3c3c3c3c",
+            "zebrafish migration plan",
+        );
+
+        let stdout = search(home.path(), &["zebrafish"]);
+
+        assert!(
+            resume_for(&stdout, "3c3c3c3c-3c3c-3c3c-3c3c-3c3c3c3c3c3c")
+                .starts_with("Resume:   cd '/home/user/my app' && claude -r "),
+            "{stdout}"
+        );
+    }
 }
 
 mod index_parsing {
