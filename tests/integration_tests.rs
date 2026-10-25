@@ -820,6 +820,38 @@ mod multi_config_root {
             "a session ID with shell syntax must be quoted:\n{stdout}"
         );
     }
+
+    #[test]
+    fn a_nested_transcript_copy_resumes_the_longer_copy() {
+        ensure_binary_built();
+        // ~/.claude-backup is searched first, but ~/.claude-work's copy of
+        // the nested transcript is longer, so it owns the session.
+        let home = tempfile::tempdir().expect("tempdir");
+        let id = "4d4d4d4d-4d4d-4d4d-4d4d-4d4d4d4d4d4d";
+        for (root, extra) in [
+            (".claude-backup", ""),
+            (".claude-work", " and a later turn"),
+        ] {
+            let dir = home
+                .path()
+                .join(root)
+                .join("projects/-home-user-nested/archive");
+            fs::create_dir_all(&dir).unwrap();
+            let line = format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"/home/user/nested\",\
+                 \"timestamp\":\"2026-02-01T10:00:00Z\",\"message\":{{\"role\":\"user\",\
+                 \"content\":[{{\"type\":\"text\",\"text\":\"zebrafish migration{extra}\"}}]}}}}\n"
+            );
+            fs::write(dir.join(format!("{id}.jsonl")), line).unwrap();
+        }
+
+        let stdout = search(home.path(), &["zebrafish", "--deep"]);
+
+        assert!(
+            resume_for(&stdout, id).contains("CLAUDE_CONFIG_DIR=$HOME/.claude-work claude -r "),
+            "{stdout}"
+        );
+    }
 }
 
 mod index_parsing {

@@ -300,28 +300,16 @@ fn session_owners(bases: &[PathBuf], project_filter: Option<&str>) -> HashMap<St
     }
     let mut copies: HashMap<String, Vec<(usize, PathBuf)>> = HashMap::new();
     for (root, base) in bases.iter().enumerate() {
-        // Only the project dirs this search will read; a copied root keeps
-        // the same project dir names, so copies are still found.
-        let projects: Vec<PathBuf> = match project_filter {
-            Some(_) => resolve_search_paths(base, project_filter),
-            None => fs::read_dir(base)
-                .map(|entries| entries.flatten().map(|e| e.path()).collect())
-                .unwrap_or_default(),
-        };
-        for project in projects {
-            let Ok(files) = fs::read_dir(&project) else {
+        // Exactly the transcripts deep search reads (nested ones included,
+        // subagents excluded), within the dirs --project selects.
+        for path in resolve_search_paths(base, project_filter)
+            .iter()
+            .flat_map(|dir| find_jsonl_files(dir, true, false))
+        {
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            for file in files.flatten() {
-                let path = file.path();
-                if path.extension().is_none_or(|e| e != "jsonl") {
-                    continue;
-                }
-                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                copies.entry(id.to_string()).or_default().push((root, path));
-            }
+            copies.entry(id.to_string()).or_default().push((root, path));
         }
     }
     copies
