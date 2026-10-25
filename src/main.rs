@@ -76,6 +76,8 @@ struct IndexMatch {
     message_count: u64,
     matched_field: String,
     score: f64,
+    session_file: Option<PathBuf>,
+    custom_title: Option<String>,
 }
 
 struct DeepMatch {
@@ -86,6 +88,7 @@ struct DeepMatch {
     timestamp: String,
     summary: Option<String>,
     first_prompt: Option<String>,
+    custom_title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -495,6 +498,8 @@ fn search_index(
                     message_count: entry.message_count,
                     matched_field,
                     score,
+                    session_file: index_session_file(&index_path, &entry.session_id),
+                    custom_title: None,
                 });
             }
         }
@@ -665,6 +670,58 @@ fn build_index_lookup(base: &Path) -> HashMap<String, SessionIndexEntry> {
         }
     }
     lookup
+}
+
+/// Read a session's user-assigned title from its transcript. Claude Code
+/// appends a `custom-title` record on each rename, so the last one wins.
+fn read_custom_title(path: &Path) -> Option<String> {
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let mut title = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Stop at the first read error: a persistent one would repeat forever
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // Cheap pre-check so ordinary message lines are never parsed
+        if !line.windows(12).any(|w| w == b"custom-title") {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(|t| t.as_str()) == Some("custom-title")
+            && let Some(t) = record.get("customTitle").and_then(|t| t.as_str())
+        {
+            let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !t.is_empty() {
+                title = Some(t);
+            }
+        }
+    }
+    title
+}
+
+/// Transcript path for an index entry. Session IDs come from the index file,
+/// so only accept a bare file name that cannot point outside the project dir.
+fn index_session_file(index_path: &Path, session_id: &str) -> Option<PathBuf> {
+    if Path::new(session_id).file_name() != Some(session_id.as_ref()) {
+        return None;
+    }
+    Some(index_path.with_file_name(format!("{session_id}.jsonl")))
+}
+
+/// Read each transcript's title at most once per search
+fn cached_custom_title(
+    cache: &mut HashMap<PathBuf, Option<String>>,
+    path: &Path,
+) -> Option<String> {
+    cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| read_custom_title(path))
+        .clone()
 }
 
 /// Parse a single ripgrep output line: /path/to/file.jsonl:LINE_NUM:json_content
@@ -906,6 +963,7 @@ fn search_deep_claude_rust(
 
     let mut matches = Vec::new();
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
+    let mut titles: HashMap<PathBuf, Option<String>> = HashMap::new();
 
     'outer: for file_path in jsonl_files {
         let Ok(file) = File::open(&file_path) else {
@@ -981,6 +1039,7 @@ fn search_deep_claude_rust(
                 timestamp,
                 summary: index_entry.map(|e| e.summary.clone()),
                 first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+                custom_title: cached_custom_title(&mut titles, &file_path),
             });
 
             *count += 1;
@@ -1080,6 +1139,7 @@ fn search_deep_openclaw_rust(
                 timestamp,
                 summary: None,
                 first_prompt: None,
+                custom_title: None,
             });
 
             *count += 1;
@@ -1144,6 +1204,7 @@ fn search_deep_claude(
 
     let mut matches = Vec::new();
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
+    let mut titles: HashMap<PathBuf, Option<String>> = HashMap::new();
 
     for line in stdout.lines() {
         if matches.len() >= limit {
@@ -1212,6 +1273,7 @@ fn search_deep_claude(
             timestamp,
             summary: index_entry.map(|e| e.summary.clone()),
             first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+            custom_title: cached_custom_title(&mut titles, &path),
         });
 
         *count += 1;
@@ -1343,6 +1405,7 @@ fn search_deep_openclaw(
             timestamp,
             summary: None,
             first_prompt: None,
+            custom_title: None,
         });
 
         *count += 1;
@@ -1582,6 +1645,9 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
             &m.summary
         };
         println!("  [{}] {}", i + 1, label);
+        if let Some(ref title) = m.custom_title {
+            println!("      Label:    {title}");
+        }
         println!("      Project:  {project_short}");
         if !m.git_branch.is_empty() {
             println!("      Branch:   {}", m.git_branch);
@@ -1653,6 +1719,9 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
             .unwrap_or("(no summary)");
 
         println!("  [{}] [{}] {}", i + 1, role, label);
+        if let Some(ref title) = m.custom_title {
+            println!("      Label:    {title}");
+        }
         println!("      Project:  {project_short}");
         println!("      Date:     {ts}");
         let clean_snippet: String = m.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1784,7 +1853,13 @@ fn main() {
             let matches = search_deep_claude(&query, cli.limit, project_filter, &base, &date_range);
             print_deep_results(&matches, &query, cli.limit, false);
         } else {
-            let matches = search_index(&query, project_filter, &base, &date_range);
+            let mut matches = search_index(&query, project_filter, &base, &date_range);
+            // Titles live in the transcripts, so only read them for displayed results
+            for m in matches.iter_mut().take(cli.limit) {
+                if let Some(path) = &m.session_file {
+                    m.custom_title = read_custom_title(path);
+                }
+            }
             print_index_results(&matches, &query, cli.limit);
         }
     }
