@@ -126,9 +126,18 @@ mod multi_config_root {
         }
         let stdout = search(home.path(), &["zebrafish", "--deep", "--limit", "2"]);
 
+        // Which personal session comes first depends on readdir order, so
+        // only count them; the work root must get the other slot.
+        let personal: usize = [
+            "11111111-1111-1111-1111-111111111111",
+            "55555555-5555-5555-5555-555555555555",
+            "66666666-6666-6666-6666-666666666666",
+        ]
+        .iter()
+        .map(|id| hits_for(&stdout, id))
+        .sum();
         assert!(
-            stdout.contains("11111111-1111-1111-1111-111111111111")
-                && stdout.contains("22222222-2222-2222-2222-222222222222"),
+            personal == 1 && hits_for(&stdout, "22222222-2222-2222-2222-222222222222") == 1,
             "both roots should be represented at --limit 2:\n{stdout}"
         );
     }
