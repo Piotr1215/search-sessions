@@ -237,19 +237,32 @@ mod multi_config_root {
             );
         }
 
-        let deep = search(home.path(), &["axolotl", "--deep", "--limit", "10"]);
-        assert_eq!(
-            hits_for(&deep, "33333333-3333-3333-3333-333333333333"),
-            1,
-            "deep search must report a session once across roots:\n{deep}"
+        // An identical copy made with `cp -r` is newer than the original;
+        // it must still defer to ~/.claude.
+        backdate(
+            &home
+                .path()
+                .join(".claude/projects/-home-user-personal")
+                .join("33333333-3333-3333-3333-333333333333.jsonl"),
         );
 
-        let index = search(home.path(), &["axolotl", "--limit", "10"]);
-        assert_eq!(
-            hits_for(&index, "33333333-3333-3333-3333-333333333333"),
-            1,
-            "index search must report a session once across roots:\n{index}"
-        );
+        for args in [
+            &["axolotl", "--limit", "10"][..],
+            &["axolotl", "--deep", "--limit", "10"][..],
+        ] {
+            let stdout = search(home.path(), args);
+            let id = "33333333-3333-3333-3333-333333333333";
+            assert_eq!(
+                hits_for(&stdout, id),
+                1,
+                "a session must be reported once across roots:\n{stdout}"
+            );
+            let resume = resume_for(&stdout, id);
+            assert!(
+                !resume.contains("CLAUDE_CONFIG_DIR"),
+                "the backup must not own the session, got: {resume}"
+            );
+        }
     }
 
     #[test]
@@ -400,7 +413,8 @@ mod multi_config_root {
         }
     }
 
-    /// Backdate a transcript so another root's copy counts as the live one
+    /// Make a transcript older than its copies, the way `cp -r` (without -p)
+    /// leaves the original behind the backup it made
     fn backdate(path: &std::path::Path) {
         let day_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
         fs::File::options()
@@ -410,7 +424,7 @@ mod multi_config_root {
             .expect("backdate transcript");
     }
 
-    /// A live session with an older copy in ~/.claude.bak, plus one session
+    /// A live session copied to ~/.claude.bak with `cp -r`, plus one session
     /// only the backup has.
     fn home_with_stale_backup(shared_text: &str) -> tempfile::TempDir {
         let home = fake_home();
@@ -426,7 +440,7 @@ mod multi_config_root {
         backdate(
             &home
                 .path()
-                .join(".claude.bak/projects/-home-user-shared")
+                .join(".claude/projects/-home-user-shared")
                 .join(format!("{shared}.jsonl")),
         );
         write_session(
@@ -443,7 +457,8 @@ mod multi_config_root {
         ensure_binary_built();
         // ~/.claude-backup is searched before ~/.claude-work and holds only
         // the stale copy, so it reaches the session first whatever order
-        // the files are read in. The newer copy must still win.
+        // the files are read in. The live copy has grown since, but has the
+        // older mtime, as after `cp -r`; the longer copy must still win.
         let home = tempfile::tempdir().expect("tempdir");
         let shared = "88888888-8888-8888-8888-888888888888";
         for root in [".claude-backup", ".claude-work"] {
@@ -460,12 +475,14 @@ mod multi_config_root {
                 "zebrafish migration plan",
             );
         }
-        backdate(
-            &home
-                .path()
-                .join(".claude-backup/projects/-home-user-shared")
-                .join(format!("{shared}.jsonl")),
-        );
+        let live = home
+            .path()
+            .join(".claude-work/projects/-home-user-shared")
+            .join(format!("{shared}.jsonl"));
+        let line = fs::read_to_string(&live).unwrap();
+        let later_turn = "{\"type\":\"system\",\"content\":\"a later turn\"}\n";
+        fs::write(&live, format!("{line}{later_turn}")).unwrap();
+        backdate(&live);
 
         for args in [
             &["zebrafish", "--limit", "10"][..],
@@ -476,7 +493,7 @@ mod multi_config_root {
             let resume = resume_for(&stdout, shared);
             assert!(
                 resume.contains("CLAUDE_CONFIG_DIR=$HOME/.claude-work claude -r "),
-                "the newer copy must own the session, got: {resume}"
+                "the longer, live copy must own the session, got: {resume}"
             );
         }
     }
@@ -495,7 +512,7 @@ mod multi_config_root {
             let line = fs::read_to_string(shared_file(root)).unwrap();
             fs::write(shared_file(root), format!("{line}{line}")).unwrap();
         }
-        backdate(&shared_file(".claude.bak"));
+        backdate(&shared_file(".claude"));
 
         let stdout = search(
             home.path(),

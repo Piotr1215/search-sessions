@@ -252,20 +252,39 @@ fn shell_path(path: &Path) -> String {
     quote(&path)
 }
 
-/// For each session with a transcript in more than one config root, the
-/// index of the root that owns it: the one whose copy was modified last,
-/// ties going to the earlier (higher-priority) root.
+/// Which config root owns a session found in several, given each root's
+/// (index, transcript length) for it: the longest copy, ties going to the
+/// earlier (higher-priority) root.
 ///
-/// A backup or copied root (~/.claude.bak) holds stale copies of live
-/// sessions. Hits from a non-owning root are skipped during the search, so
-/// they neither use up that root's --limit nor print a Resume command that
-/// would continue the conversation inside the backup.
+/// A backup or copied root (~/.claude.bak) holds copies of live sessions.
+/// Transcripts only grow, so a stale copy is never longer than the live
+/// one, and an identical copy defers to root priority. Modification time
+/// can't be used: `cp -r` gives the copy a newer one than the original.
+fn session_owner(copies: &[(usize, u64)]) -> Option<usize> {
+    copies
+        .iter()
+        .max_by(|(ra, la), (rb, lb)| la.cmp(lb).then(rb.cmp(ra)))
+        .map(|&(root, _)| root)
+}
+
+/// Owner of every session that has copies in more than one root
+fn owners_of(copies: HashMap<String, Vec<(usize, u64)>>) -> HashMap<String, usize> {
+    copies
+        .into_iter()
+        .filter(|(_, c)| c.iter().any(|&(root, _)| root != c[0].0))
+        .filter_map(|(id, c)| session_owner(&c).map(|root| (id, root)))
+        .collect()
+}
+
+/// Owners of sessions with a transcript in more than one config root, for
+/// deep search. Hits from a non-owning root are skipped during the search,
+/// so they neither use up that root's --limit nor print a Resume command
+/// that would continue the conversation inside the backup.
 fn session_owners(bases: &[PathBuf]) -> HashMap<String, usize> {
     if bases.len() < 2 {
         return HashMap::new();
     }
-    let mut newest: HashMap<String, (usize, std::time::SystemTime)> = HashMap::new();
-    let mut roots_seen: HashMap<String, usize> = HashMap::new();
+    let mut copies: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
     for (root, base) in bases.iter().enumerate() {
         let Ok(projects) = fs::read_dir(base) else {
             continue;
@@ -282,25 +301,12 @@ fn session_owners(bases: &[PathBuf]) -> HashMap<String, usize> {
                 let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                let modified = file
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                *roots_seen.entry(id.to_string()).or_insert(0) += 1;
-                match newest.get(id) {
-                    Some(&(_, best)) if best >= modified => {}
-                    _ => {
-                        newest.insert(id.to_string(), (root, modified));
-                    }
-                }
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                copies.entry(id.to_string()).or_default().push((root, len));
             }
         }
     }
-    newest
-        .into_iter()
-        .filter(|(id, _)| roots_seen.get(id).is_some_and(|&n| n > 1))
-        .map(|(id, (root, _))| (id, root))
-        .collect()
+    owners_of(copies)
 }
 
 /// Drop hits for a session already reported from a different config root.
@@ -2070,13 +2076,13 @@ fn main() {
         }
 
         let project_filter = cli.project.as_deref();
-        let owners = session_owners(&bases);
-        let owned_by = |root: usize| {
-            let owners = &owners;
-            move |id: &str| owners.get(id).is_none_or(|&owner| owner == root)
-        };
 
         if cli.deep {
+            let owners = session_owners(&bases);
+            let owned_by = |root: usize| {
+                let owners = &owners;
+                move |id: &str| owners.get(id).is_none_or(|&owner| owner == root)
+            };
             let mut per_root: Vec<std::vec::IntoIter<DeepMatch>> = bases
                 .iter()
                 .enumerate()
@@ -2123,13 +2129,37 @@ fn main() {
                 merged.extend(
                     search_index(&query, project_filter, base, &date_range)
                         .into_iter()
-                        .filter(|m| owned_by(root)(&m.session_id))
                         .map(|mut m| {
                             m.config_dir.clone_from(&config_dir);
                             (root, m)
                         }),
                 );
             }
+            // Index hits are few and name their transcript, so only sessions
+            // that matched in more than one root need their copies compared.
+            let mut first_root: HashMap<&str, usize> = HashMap::new();
+            let shared: HashSet<&str> = merged
+                .iter()
+                .filter(|(root, m)| *first_root.entry(&m.session_id).or_insert(*root) != *root)
+                .map(|(_, m)| m.session_id.as_str())
+                .collect();
+            let mut copies: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
+            for (root, m) in merged
+                .iter()
+                .filter(|(_, m)| shared.contains(m.session_id.as_str()))
+            {
+                let len = m
+                    .session_file
+                    .as_ref()
+                    .and_then(|f| fs::metadata(f).ok())
+                    .map_or(0, |md| md.len());
+                copies
+                    .entry(m.session_id.clone())
+                    .or_default()
+                    .push((*root, len));
+            }
+            let owners = owners_of(copies);
+            merged.retain(|(root, m)| owners.get(&m.session_id).is_none_or(|owner| owner == root));
             // Each root sorted its own results; re-sort so the merged list is
             // ranked globally rather than grouped by which root it came from.
             merged.sort_by(|(_, a), (_, b)| {
