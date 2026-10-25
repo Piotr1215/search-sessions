@@ -700,6 +700,35 @@ mod multi_config_root {
             "resume must target the root holding the transcript, got: {resume}"
         );
     }
+
+    #[test]
+    fn resume_command_keeps_a_bare_home_dir_unquoted() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        let id = "7e7e7e7e-7e7e-7e7e-7e7e-7e7e7e7e7e7e";
+        let dir = home.path().join(".claude/projects/-home");
+        fs::create_dir_all(&dir).unwrap();
+        let index = serde_json::json!({
+            "originalPath": home.path(),
+            "entries": [{
+                "sessionId": id,
+                "firstPrompt": "zebrafish",
+                "summary": "zebrafish migration plan",
+                "messageCount": 1,
+                "created": "2026-02-01T10:00:00Z",
+                "modified": "2026-02-01T10:00:00Z",
+                "projectPath": home.path(),
+            }],
+        });
+        fs::write(dir.join("sessions-index.json"), index.to_string()).unwrap();
+
+        let stdout = search(home.path(), &["zebrafish"]);
+
+        assert!(
+            resume_for(&stdout, id).starts_with("Resume:   cd ~ && claude -r "),
+            "{stdout}"
+        );
+    }
 }
 
 mod index_parsing {
