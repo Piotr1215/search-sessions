@@ -2299,8 +2299,15 @@ fn main() {
                 merged,
                 |m| &m.session_id,
                 &owners,
-                |m, _, owner| {
+                |m, root, owner| {
                     m.config_dir.clone_from(&resume_dirs[owner]);
+                    // Read the custom title from the owner's transcript
+                    if owner != root
+                        && let Some(file) = &m.session_file
+                        && let Ok(rel) = file.strip_prefix(&bases[root])
+                    {
+                        m.session_file = Some(bases[owner].join(rel));
+                    }
                 },
             )
             .into_iter()

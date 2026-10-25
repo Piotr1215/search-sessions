@@ -769,6 +769,38 @@ mod multi_config_root {
             "{stdout}"
         );
     }
+
+    #[test]
+    fn an_index_hit_from_a_backup_shows_the_owners_custom_title() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        let id = "1e1e1e1e-1e1e-1e1e-1e1e-1e1e1e1e1e1e";
+        write_index(
+            &home.path().join(".claude.bak"),
+            "-home-user-titled",
+            id,
+            "axolotl tank setup",
+        );
+        write_session(
+            &home.path().join(".claude"),
+            "-home-user-titled",
+            id,
+            "live transcript",
+        );
+        let live = home
+            .path()
+            .join(".claude/projects/-home-user-titled")
+            .join(format!("{id}.jsonl"));
+        let mut text = fs::read_to_string(&live).unwrap();
+        text.push_str(&format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"Live title\",\"sessionId\":\"{id}\"}}\n"
+        ));
+        fs::write(&live, text).unwrap();
+
+        let stdout = search(home.path(), &["axolotl"]);
+
+        assert!(stdout.contains("Label:    Live title"), "{stdout}");
+    }
 }
 
 mod index_parsing {
