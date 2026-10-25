@@ -1255,7 +1255,9 @@ fn search_deep_claude_rust(
         let reader = BufReader::new(file);
 
         for line in reader.lines() {
-            if owned_hits >= limit {
+            if owned_hits >= limit
+                || matches.len() >= limit.saturating_mul(MAX_MATCHES_PER_SESSION + 1)
+            {
                 break 'outer;
             }
 
@@ -1441,7 +1443,9 @@ fn search_deep_openclaw_rust(
 
 /// `owned` says whether this root owns a session ID. Hits for sessions owned
 /// by another config root are still returned, but don't count toward
-/// `limit`, so a backup's copies can't crowd out its own sessions.
+/// `limit`, so a backup's copies can't crowd out its own sessions. A hard
+/// ceiling on all hits keeps a root that owns nothing from being read end
+/// to end.
 fn search_deep_claude(
     query: &str,
     limit: usize,
@@ -1505,7 +1509,8 @@ fn search_deep_claude(
     let mut titles: HashMap<PathBuf, Option<String>> = HashMap::new();
 
     for line in stdout.lines() {
-        if owned_hits >= limit {
+        if owned_hits >= limit || matches.len() >= limit.saturating_mul(MAX_MATCHES_PER_SESSION + 1)
+        {
             break;
         }
 
