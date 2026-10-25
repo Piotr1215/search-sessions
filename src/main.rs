@@ -1973,9 +1973,11 @@ fn main() {
         // results merged; searching only one silently hides whole accounts.
         let bases = claude_projects_dirs();
         if bases.is_empty() {
+            let pattern = dirs::home_dir()
+                .map(|h| h.join(".claude*").join("projects").display().to_string())
+                .unwrap_or_else(|| "~/.claude*/projects (home directory unknown)".to_string());
             eprintln!(
-                "ERROR: no Claude projects directory found under {}",
-                dirs::home_dir().unwrap_or_default().display()
+                "ERROR: no Claude projects directory found (looked in $CLAUDE_CONFIG_DIR/projects and {pattern})"
             );
             std::process::exit(1);
         }
