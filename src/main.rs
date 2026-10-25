@@ -374,13 +374,13 @@ fn index_owners(bases: &[PathBuf], hits: &[(usize, IndexMatch)]) -> HashMap<Stri
 
 /// Keep one root's hits per session: the owner's if the owner matched,
 /// otherwise the first root that did (a copy can hold a match the owner's
-/// copy doesn't). Each hit's Resume command targets the session's owner.
+/// copy doesn't). `retarget(hit, root, owner)` points each kept hit at the
+/// session's owner, which its Resume command targets.
 fn pick_session_hits<T>(
     hits: Vec<(usize, T)>,
     session_id: impl Fn(&T) -> &str,
     owners: &HashMap<String, usize>,
-    resume_dirs: &[Option<PathBuf>],
-    set_config_dir: impl Fn(&mut T, Option<PathBuf>),
+    retarget: impl Fn(&mut T, usize, usize),
 ) -> Vec<(usize, T)> {
     let mut shown: HashMap<String, usize> = HashMap::new();
     for (root, hit) in &hits {
@@ -396,8 +396,8 @@ fn pick_session_hits<T>(
             id.is_empty() || shown.get(id) == Some(root)
         })
         .map(|(root, mut hit)| {
-            let resume_root = owners.get(session_id(&hit)).copied().unwrap_or(root);
-            set_config_dir(&mut hit, resume_dirs[resume_root].clone());
+            let owner = owners.get(session_id(&hit)).copied().unwrap_or(root);
+            retarget(&mut hit, root, owner);
             (root, hit)
         })
         .collect()
@@ -1228,6 +1228,7 @@ fn search_deep_claude_rust(
     base: &Path,
     date_range: &DateRange,
     owned: &dyn Fn(&str) -> bool,
+    owns_any: bool,
 ) -> Vec<DeepMatch> {
     warn_ripgrep_not_available();
 
@@ -1246,6 +1247,7 @@ fn search_deep_claude_rust(
 
     let mut matches = Vec::new();
     let mut owned_hits = 0;
+    let mut unowned_hits = 0;
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
     let mut titles: HashMap<PathBuf, Option<String>> = HashMap::new();
 
@@ -1256,9 +1258,7 @@ fn search_deep_claude_rust(
         let reader = BufReader::new(file);
 
         for line in reader.lines() {
-            if owned_hits >= limit
-                || matches.len() >= limit.saturating_mul(MAX_MATCHES_PER_SESSION + 1)
-            {
+            if owned_hits >= limit || (!owns_any && unowned_hits >= unowned_cap(limit)) {
                 break 'outer;
             }
 
@@ -1282,6 +1282,10 @@ fn search_deep_claude_rust(
                 .to_string();
 
             let is_owned = owned(&session_id);
+
+            if !is_owned && unowned_hits >= unowned_cap(limit) {
+                continue;
+            }
 
             let count = seen_sessions.entry(session_id.clone()).or_insert(0);
             if *count >= MAX_MATCHES_PER_SESSION {
@@ -1334,6 +1338,8 @@ fn search_deep_claude_rust(
             *count += 1;
             if is_owned {
                 owned_hits += 1;
+            } else {
+                unowned_hits += 1;
             }
         }
     }
@@ -1442,10 +1448,16 @@ fn search_deep_openclaw_rust(
     matches
 }
 
+/// Most hits for sessions another root owns that one root's deep search keeps
+fn unowned_cap(limit: usize) -> usize {
+    limit.saturating_mul(MAX_MATCHES_PER_SESSION)
+}
+
 /// `owned` says whether this root owns a session ID. Hits for sessions owned
 /// by another config root are still returned, but don't count toward
-/// `limit`, so a backup's copies can't crowd out its own sessions. A hard
-/// ceiling on all hits keeps a root that owns nothing from being read end
+/// `limit`, so a backup's copies can't crowd out its own sessions. At most
+/// `unowned_cap(limit)` of them are kept; once that is reached a root that
+/// owns no sessions (`owns_any` false) stops early instead of being read end
 /// to end.
 fn search_deep_claude(
     query: &str,
@@ -1454,10 +1466,19 @@ fn search_deep_claude(
     base: &Path,
     date_range: &DateRange,
     owned: &dyn Fn(&str) -> bool,
+    owns_any: bool,
 ) -> Vec<DeepMatch> {
     // Check if ripgrep is available, fall back to pure Rust if not
     if !is_ripgrep_available() {
-        return search_deep_claude_rust(query, limit, project_filter, base, date_range, owned);
+        return search_deep_claude_rust(
+            query,
+            limit,
+            project_filter,
+            base,
+            date_range,
+            owned,
+            owns_any,
+        );
     }
 
     let search_paths = resolve_search_paths(base, project_filter);
@@ -1490,7 +1511,15 @@ fn search_deep_claude(
         Err(e) => {
             // Fallback to Rust if ripgrep fails unexpectedly
             eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback.");
-            return search_deep_claude_rust(query, limit, project_filter, base, date_range, owned);
+            return search_deep_claude_rust(
+                query,
+                limit,
+                project_filter,
+                base,
+                date_range,
+                owned,
+                owns_any,
+            );
         }
     };
 
@@ -1506,12 +1535,12 @@ fn search_deep_claude(
 
     let mut matches = Vec::new();
     let mut owned_hits = 0;
+    let mut unowned_hits = 0;
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
     let mut titles: HashMap<PathBuf, Option<String>> = HashMap::new();
 
     for line in stdout.lines() {
-        if owned_hits >= limit || matches.len() >= limit.saturating_mul(MAX_MATCHES_PER_SESSION + 1)
-        {
+        if owned_hits >= limit || (!owns_any && unowned_hits >= unowned_cap(limit)) {
             break;
         }
 
@@ -1533,6 +1562,10 @@ fn search_deep_claude(
             .to_string();
 
         let is_owned = owned(&session_id);
+
+        if !is_owned && unowned_hits >= unowned_cap(limit) {
+            continue;
+        }
 
         let count = seen_sessions.entry(session_id.clone()).or_insert(0);
         if *count >= MAX_MATCHES_PER_SESSION {
@@ -1586,6 +1619,8 @@ fn search_deep_claude(
         *count += 1;
         if is_owned {
             owned_hits += 1;
+        } else {
+            unowned_hits += 1;
         }
     }
 
@@ -2182,25 +2217,47 @@ fn main() {
                 .enumerate()
                 .flat_map(|(root, base)| {
                     let owned = |id: &str| owners.get(id).is_none_or(|&owner| owner == root);
-                    search_deep_claude(&query, cli.limit, project_filter, base, &date_range, &owned)
-                        .into_iter()
-                        .map(move |hit| (root, hit))
+                    let owns_any = owners.is_empty() || owners.values().any(|&o| o == root);
+                    search_deep_claude(
+                        &query,
+                        cli.limit,
+                        project_filter,
+                        base,
+                        &date_range,
+                        &owned,
+                        owns_any,
+                    )
+                    .into_iter()
+                    .map(move |hit| (root, hit))
                 })
                 .collect();
             // Pick each session's hits before interleaving, so copies shown
             // from another root don't take a root's turns in the round-robin.
-            let mut per_root: Vec<Vec<DeepMatch>> = bases.iter().map(|_| Vec::new()).collect();
+            // A root's own sessions go ahead of copies it shows for another
+            // root's sessions (the owner may simply have hit its --limit).
+            let mut own: Vec<Vec<DeepMatch>> = bases.iter().map(|_| Vec::new()).collect();
+            let mut copies: Vec<Vec<DeepMatch>> = bases.iter().map(|_| Vec::new()).collect();
             for (root, hit) in pick_session_hits(
                 found,
                 |m| &m.session_id,
                 &owners,
-                &resume_dirs,
-                |m, dir| m.config_dir = dir,
+                |m, _, owner| {
+                    m.config_dir.clone_from(&resume_dirs[owner]);
+                },
             ) {
-                per_root[root].push(hit);
+                match owners.get(&hit.session_id) {
+                    Some(&owner) if owner != root => copies[root].push(hit),
+                    _ => own[root].push(hit),
+                }
             }
-            let mut per_root: Vec<std::vec::IntoIter<DeepMatch>> =
-                per_root.into_iter().map(Vec::into_iter).collect();
+            let mut per_root: Vec<std::vec::IntoIter<DeepMatch>> = own
+                .into_iter()
+                .zip(copies)
+                .map(|(mut own, copies)| {
+                    own.extend(copies);
+                    own.into_iter()
+                })
+                .collect();
             // Deep matches carry no comparable score (ripgrep returns file
             // order), so a plain concatenation lets the first root consume the
             // whole limit and hide every other account. Round-robin instead, so
@@ -2242,8 +2299,9 @@ fn main() {
                 merged,
                 |m| &m.session_id,
                 &owners,
-                &resume_dirs,
-                |m, dir| m.config_dir = dir,
+                |m, _, owner| {
+                    m.config_dir.clone_from(&resume_dirs[owner]);
+                },
             )
             .into_iter()
             .map(|(_, m)| m)

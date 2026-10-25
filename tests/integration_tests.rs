@@ -729,6 +729,46 @@ mod multi_config_root {
             "{stdout}"
         );
     }
+
+    #[test]
+    fn many_shadowed_copies_do_not_stop_a_backup_before_its_own_sessions() {
+        ensure_binary_built();
+        // Eight matching lines from sessions ~/.claude owns, more than the
+        // backup may keep at --limit 2, plus one session only it has.
+        let home = tempfile::tempdir().expect("tempdir");
+        for n in 0..4 {
+            let id = format!("{n}{n}{n}{n}{n}{n}{n}{n}-0000-0000-0000-000000000000");
+            for root in [".claude", ".claude.bak"] {
+                write_session(
+                    &home.path().join(root),
+                    "-home-user-many",
+                    &id,
+                    "zebrafish migration",
+                );
+                let file = home
+                    .path()
+                    .join(root)
+                    .join("projects/-home-user-many")
+                    .join(format!("{id}.jsonl"));
+                let line = fs::read_to_string(&file).unwrap();
+                fs::write(&file, format!("{line}{line}")).unwrap();
+            }
+        }
+        write_session(
+            &home.path().join(".claude.bak"),
+            "-home-user-many",
+            "99999999-9999-9999-9999-999999999999",
+            "only in the backup: zebrafish migration",
+        );
+
+        let stdout = search(home.path(), &["zebrafish", "--deep", "--limit", "2"]);
+
+        assert_eq!(
+            hits_for(&stdout, "99999999-9999-9999-9999-999999999999"),
+            1,
+            "{stdout}"
+        );
+    }
 }
 
 mod index_parsing {
