@@ -281,7 +281,7 @@ mod multi_config_root {
             );
             assert!(
                 resume_for(&stdout, "22222222-2222-2222-2222-222222222222")
-                    .contains("&& CLAUDE_CONFIG_DIR=~/.claude-work claude -r "),
+                    .contains("&& CLAUDE_CONFIG_DIR=$HOME/.claude-work claude -r "),
                 "a work-root session must resume with its own config dir:\n{stdout}"
             );
         }
@@ -323,7 +323,7 @@ mod multi_config_root {
         );
         assert!(
             resume_for(&stdout, "11111111-1111-1111-1111-111111111111")
-                .contains("CLAUDE_CONFIG_DIR=~/.claude claude -r "),
+                .contains("CLAUDE_CONFIG_DIR=$HOME/.claude claude -r "),
             "with CLAUDE_CONFIG_DIR set elsewhere, ~/.claude needs an override:\n{stdout}"
         );
     }
@@ -398,6 +398,26 @@ mod multi_config_root {
         ] {
             assert_eq!(hits_for(&stdout, id), 1, "missing {id}:\n{stdout}");
         }
+    }
+
+    #[test]
+    fn resume_command_quotes_a_config_dir_with_a_space() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        write_session(
+            &home.path().join(".claude work"),
+            "-home-user-spaced",
+            "12121212-1212-1212-1212-121212121212",
+            "spaced transcript about zebrafish migration",
+        );
+
+        let stdout = search(home.path(), &["zebrafish", "--deep"]);
+
+        assert!(
+            resume_for(&stdout, "12121212-1212-1212-1212-121212121212")
+                .contains("CLAUDE_CONFIG_DIR=$HOME/'.claude work' claude -r "),
+            "{stdout}"
+        );
     }
 }
 

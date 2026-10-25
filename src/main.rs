@@ -165,7 +165,7 @@ fn claude_projects_dirs() -> Vec<PathBuf> {
         }
     };
 
-    if let Ok(configured) = std::env::var("CLAUDE_CONFIG_DIR")
+    if let Some(configured) = std::env::var_os("CLAUDE_CONFIG_DIR")
         && !configured.is_empty()
     {
         push(PathBuf::from(configured).join("projects"));
@@ -222,10 +222,34 @@ fn resume_command(project_short: &str, session_id: &str, config_dir: Option<&Pat
     match config_dir {
         Some(dir) => format!(
             "cd {project_short} && CLAUDE_CONFIG_DIR={} claude -r {session_id}",
-            format_project_path(&dir.to_string_lossy())
+            shell_path(dir)
         ),
         None => format!("cd {project_short} && claude -r {session_id}"),
     }
+}
+
+/// A path as a shell word that bash, zsh and fish all read back unchanged.
+/// Paths under the home directory use $HOME, which (unlike ~ after `=`)
+/// every one of those shells expands in a `VAR=value cmd` prefix.
+fn shell_path(path: &Path) -> String {
+    fn quote(s: &str) -> String {
+        if !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,".contains(c))
+        {
+            s.to_string()
+        } else {
+            format!("'{}'", s.replace('\'', r"'\''"))
+        }
+    }
+    let path = path.to_string_lossy();
+    if let Some(home) = dirs::home_dir()
+        && let Some(rest) = path.strip_prefix(home.to_string_lossy().as_ref())
+        && rest.starts_with('/')
+    {
+        return format!("$HOME/{}", quote(&rest[1..]));
+    }
+    quote(&path)
 }
 
 /// Drop hits for a session already reported from a different config root.
