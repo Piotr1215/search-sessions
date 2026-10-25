@@ -111,8 +111,19 @@ mod multi_config_root {
     fn a_low_limit_does_not_let_one_root_starve_the_others() {
         ensure_binary_built();
         let home = fake_home();
-        // One result per root is exactly enough to expose concatenation:
-        // a plain extend() would return two hits from the first root.
+        // Give the first root more hits than the limit, so a plain
+        // concatenation would fill --limit 2 from ~/.claude alone.
+        for session in [
+            "55555555-5555-5555-5555-555555555555",
+            "66666666-6666-6666-6666-666666666666",
+        ] {
+            write_session(
+                &home.path().join(".claude"),
+                "-home-user-personal",
+                session,
+                "another personal transcript about zebrafish migration",
+            );
+        }
         let stdout = search(home.path(), &["zebrafish", "--deep", "--limit", "2"]);
 
         assert!(
@@ -151,6 +162,16 @@ mod multi_config_root {
     }
 
     fn write_index(root: &std::path::Path, project: &str, session: &str, summary: &str) {
+        write_index_modified(root, project, session, summary, "2026-02-01T10:00:00Z");
+    }
+
+    fn write_index_modified(
+        root: &std::path::Path,
+        project: &str,
+        session: &str,
+        summary: &str,
+        modified: &str,
+    ) {
         let dir = root.join("projects").join(project);
         fs::create_dir_all(&dir).expect("create project dir");
         let index = serde_json::json!({
@@ -160,8 +181,8 @@ mod multi_config_root {
                 "firstPrompt": summary,
                 "summary": summary,
                 "messageCount": 1,
-                "created": "2026-02-01T10:00:00Z",
-                "modified": "2026-02-01T10:00:00Z",
+                "created": modified,
+                "modified": modified,
                 "projectPath": format!("/home/user/{project}"),
             }],
         });
@@ -314,6 +335,60 @@ mod multi_config_root {
             1,
             "{stdout}"
         );
+    }
+
+    #[test]
+    fn index_hits_are_ranked_across_roots_not_grouped_by_root() {
+        ensure_binary_built();
+        let home = fake_home();
+        write_index_modified(
+            &home.path().join(".claude"),
+            "-home-user-personal",
+            "11111111-1111-1111-1111-111111111111",
+            "zebrafish migration plan",
+            "2026-02-01T10:00:00Z",
+        );
+        write_index_modified(
+            &home.path().join(".claude-work"),
+            "-home-user-work-api",
+            "22222222-2222-2222-2222-222222222222",
+            "zebrafish migration plan",
+            "2026-02-05T10:00:00Z",
+        );
+
+        // Equal scores, so the newer work-root hit must outrank ~/.claude's
+        let stdout = search(home.path(), &["zebrafish", "--limit", "1"]);
+
+        assert!(stdout.contains("2 matches found"), "{stdout}");
+        assert_eq!(
+            hits_for(&stdout, "22222222-2222-2222-2222-222222222222"),
+            1,
+            "the newest hit should be shown first:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn project_filter_searches_every_matching_worktree_dir() {
+        ensure_binary_built();
+        let home = fake_home();
+        write_session(
+            &home.path().join(".claude-work"),
+            "-home-user-work-api--claude-worktrees-feature-x",
+            "77777777-7777-7777-7777-777777777777",
+            "worktree transcript about zebrafish migration",
+        );
+
+        let stdout = search(
+            home.path(),
+            &["zebrafish", "--deep", "--project", "work-api"],
+        );
+
+        for id in [
+            "22222222-2222-2222-2222-222222222222",
+            "77777777-7777-7777-7777-777777777777",
+        ] {
+            assert_eq!(hits_for(&stdout, id), 1, "missing {id}:\n{stdout}");
+        }
     }
 }
 
