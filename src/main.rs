@@ -228,28 +228,30 @@ fn resume_command(project_short: &str, session_id: &str, config_dir: Option<&Pat
     }
 }
 
+/// `s` as a single shell word, quoted only when it has to be
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// A path as a shell word that bash, zsh and fish all read back unchanged.
 /// Paths under the home directory use $HOME, which (unlike ~ after `=`)
 /// every one of those shells expands in a `VAR=value cmd` prefix.
 fn shell_path(path: &Path) -> String {
-    fn quote(s: &str) -> String {
-        if !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,".contains(c))
-        {
-            s.to_string()
-        } else {
-            format!("'{}'", s.replace('\'', r"'\''"))
-        }
-    }
     let path = path.to_string_lossy();
     if let Some(home) = dirs::home_dir()
         && let Some(rest) = path.strip_prefix(home.to_string_lossy().as_ref())
         && rest.starts_with('/')
     {
-        return format!("$HOME/{}", quote(&rest[1..]));
+        return format!("$HOME/{}", shell_quote(&rest[1..]));
     }
-    quote(&path)
+    shell_quote(&path)
 }
 
 /// Which config root owns a session found in several, given each root's
@@ -267,24 +269,17 @@ fn session_owner(copies: &[(usize, u64)]) -> Option<usize> {
         .map(|&(root, _)| root)
 }
 
-/// Owner of every session that has copies in more than one root
-fn owners_of(copies: HashMap<String, Vec<(usize, u64)>>) -> HashMap<String, usize> {
-    copies
-        .into_iter()
-        .filter(|(_, c)| c.iter().any(|&(root, _)| root != c[0].0))
-        .filter_map(|(id, c)| session_owner(&c).map(|root| (id, root)))
-        .collect()
-}
-
-/// Owners of sessions with a transcript in more than one config root, for
-/// deep search. Hits from a non-owning root are skipped during the search,
-/// so they neither use up that root's --limit nor print a Resume command
-/// that would continue the conversation inside the backup.
+/// Owners of sessions with a transcript in more than one config root.
+///
+/// Ownership never hides a match: it decides which root's hits are shown
+/// when several roots match the same session, and which root the Resume
+/// command targets, so resuming continues the live copy rather than a
+/// backup's. Only sessions found in more than one root are stat'ed.
 fn session_owners(bases: &[PathBuf]) -> HashMap<String, usize> {
     if bases.len() < 2 {
         return HashMap::new();
     }
-    let mut copies: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
+    let mut copies: HashMap<String, Vec<(usize, PathBuf)>> = HashMap::new();
     for (root, base) in bases.iter().enumerate() {
         let Ok(projects) = fs::read_dir(base) else {
             continue;
@@ -301,28 +296,51 @@ fn session_owners(bases: &[PathBuf]) -> HashMap<String, usize> {
                 let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                copies.entry(id.to_string()).or_default().push((root, len));
+                copies.entry(id.to_string()).or_default().push((root, path));
             }
         }
     }
-    owners_of(copies)
+    copies
+        .into_iter()
+        .filter(|(_, c)| c.iter().any(|(root, _)| *root != c[0].0))
+        .filter_map(|(id, c)| {
+            let lens: Vec<(usize, u64)> = c
+                .iter()
+                .map(|(root, path)| (*root, fs::metadata(path).map_or(0, |m| m.len())))
+                .collect();
+            session_owner(&lens).map(|root| (id, root))
+        })
+        .collect()
 }
 
-/// Drop hits for a session already reported from a different config root.
-/// Backstop for sessions `session_owners` can't place (a transcript not
-/// named after its session ID).
-fn dedupe_sessions_across_roots<T>(
+/// Keep one root's hits per session: the owner's if the owner matched,
+/// otherwise the first root that did (a copy can hold a match the owner's
+/// copy doesn't). Each hit's Resume command targets the session's owner.
+fn pick_session_hits<T>(
     hits: Vec<(usize, T)>,
     session_id: impl Fn(&T) -> &str,
-) -> Vec<T> {
-    let mut owner: HashMap<String, usize> = HashMap::new();
+    owners: &HashMap<String, usize>,
+    resume_dirs: &[Option<PathBuf>],
+    set_config_dir: impl Fn(&mut T, Option<PathBuf>),
+) -> Vec<(usize, T)> {
+    let mut shown: HashMap<String, usize> = HashMap::new();
+    for (root, hit) in &hits {
+        let id = session_id(hit);
+        let entry = shown.entry(id.to_string()).or_insert(*root);
+        if owners.get(id) == Some(root) {
+            *entry = *root;
+        }
+    }
     hits.into_iter()
         .filter(|(root, hit)| {
             let id = session_id(hit);
-            id.is_empty() || *owner.entry(id.to_string()).or_insert(*root) == *root
+            id.is_empty() || shown.get(id) == Some(root)
         })
-        .map(|(_, hit)| hit)
+        .map(|(root, mut hit)| {
+            let resume_root = owners.get(session_id(&hit)).copied().unwrap_or(root);
+            set_config_dir(&mut hit, resume_dirs[resume_root].clone());
+            (root, hit)
+        })
         .collect()
 }
 
@@ -1168,6 +1186,7 @@ fn search_deep_claude_rust(
         .collect();
 
     let mut matches = Vec::new();
+    let mut owned_hits = 0;
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
     let mut titles: HashMap<PathBuf, Option<String>> = HashMap::new();
 
@@ -1178,7 +1197,7 @@ fn search_deep_claude_rust(
         let reader = BufReader::new(file);
 
         for line in reader.lines() {
-            if matches.len() >= limit {
+            if owned_hits >= limit {
                 break 'outer;
             }
 
@@ -1201,9 +1220,7 @@ fn search_deep_claude_rust(
                 .unwrap_or("")
                 .to_string();
 
-            if !owned(&session_id) {
-                continue;
-            }
+            let is_owned = owned(&session_id);
 
             let count = seen_sessions.entry(session_id.clone()).or_insert(0);
             if *count >= MAX_MATCHES_PER_SESSION {
@@ -1254,6 +1271,9 @@ fn search_deep_claude_rust(
             });
 
             *count += 1;
+            if is_owned {
+                owned_hits += 1;
+            }
         }
     }
 
@@ -1361,8 +1381,9 @@ fn search_deep_openclaw_rust(
     matches
 }
 
-/// `owned` says whether this root owns a session ID; hits for sessions owned
-/// by another config root are skipped and don't count toward `limit`.
+/// `owned` says whether this root owns a session ID. Hits for sessions owned
+/// by another config root are still returned, but don't count toward
+/// `limit`, so a backup's copies can't crowd out its own sessions.
 fn search_deep_claude(
     query: &str,
     limit: usize,
@@ -1421,11 +1442,12 @@ fn search_deep_claude(
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut matches = Vec::new();
+    let mut owned_hits = 0;
     let mut seen_sessions: HashMap<String, usize> = HashMap::new();
     let mut titles: HashMap<PathBuf, Option<String>> = HashMap::new();
 
     for line in stdout.lines() {
-        if matches.len() >= limit {
+        if owned_hits >= limit {
             break;
         }
 
@@ -1446,9 +1468,7 @@ fn search_deep_claude(
             .unwrap_or("")
             .to_string();
 
-        if !owned(&session_id) {
-            continue;
-        }
+        let is_owned = owned(&session_id);
 
         let count = seen_sessions.entry(session_id.clone()).or_insert(0);
         if *count >= MAX_MATCHES_PER_SESSION {
@@ -1500,6 +1520,9 @@ fn search_deep_claude(
         });
 
         *count += 1;
+        if is_owned {
+            owned_hits += 1;
+        }
     }
 
     matches
@@ -2076,43 +2099,46 @@ fn main() {
         }
 
         let project_filter = cli.project.as_deref();
+        let owners = session_owners(&bases);
+        let resume_dirs: Vec<Option<PathBuf>> =
+            bases.iter().map(|base| resume_config_dir(base)).collect();
 
         if cli.deep {
-            let owners = session_owners(&bases);
-            let owned_by = |root: usize| {
-                let owners = &owners;
-                move |id: &str| owners.get(id).is_none_or(|&owner| owner == root)
-            };
-            let mut per_root: Vec<std::vec::IntoIter<DeepMatch>> = bases
+            let found: Vec<(usize, DeepMatch)> = bases
                 .iter()
                 .enumerate()
-                .map(|(root, base)| {
-                    let config_dir = resume_config_dir(base);
-                    let mut hits = search_deep_claude(
-                        &query,
-                        cli.limit,
-                        project_filter,
-                        base,
-                        &date_range,
-                        &owned_by(root),
-                    );
-                    for hit in &mut hits {
-                        hit.config_dir.clone_from(&config_dir);
-                    }
-                    hits.into_iter()
+                .flat_map(|(root, base)| {
+                    let owned = |id: &str| owners.get(id).is_none_or(|&owner| owner == root);
+                    search_deep_claude(&query, cli.limit, project_filter, base, &date_range, &owned)
+                        .into_iter()
+                        .map(move |hit| (root, hit))
                 })
                 .collect();
+            // Pick each session's hits before interleaving, so copies shown
+            // from another root don't take a root's turns in the round-robin.
+            let mut per_root: Vec<Vec<DeepMatch>> = bases.iter().map(|_| Vec::new()).collect();
+            for (root, hit) in pick_session_hits(
+                found,
+                |m| &m.session_id,
+                &owners,
+                &resume_dirs,
+                |m, dir| m.config_dir = dir,
+            ) {
+                per_root[root].push(hit);
+            }
+            let mut per_root: Vec<std::vec::IntoIter<DeepMatch>> =
+                per_root.into_iter().map(Vec::into_iter).collect();
             // Deep matches carry no comparable score (ripgrep returns file
             // order), so a plain concatenation lets the first root consume the
             // whole limit and hide every other account. Round-robin instead, so
             // a low --limit shows a spread across accounts rather than only the
             // alphabetically-first one.
-            let mut merged = Vec::new();
+            let mut matches = Vec::new();
             loop {
                 let mut progressed = false;
-                for (root, hits) in per_root.iter_mut().enumerate() {
+                for hits in per_root.iter_mut() {
                     if let Some(hit) = hits.next() {
-                        merged.push((root, hit));
+                        matches.push(hit);
                         progressed = true;
                     }
                 }
@@ -2120,46 +2146,16 @@ fn main() {
                     break;
                 }
             }
-            let matches = dedupe_sessions_across_roots(merged, |m| &m.session_id);
             print_deep_results(&matches, &query, cli.limit, false);
         } else {
             let mut merged = Vec::new();
             for (root, base) in bases.iter().enumerate() {
-                let config_dir = resume_config_dir(base);
                 merged.extend(
                     search_index(&query, project_filter, base, &date_range)
                         .into_iter()
-                        .map(|mut m| {
-                            m.config_dir.clone_from(&config_dir);
-                            (root, m)
-                        }),
+                        .map(|m| (root, m)),
                 );
             }
-            // Index hits are few and name their transcript, so only sessions
-            // that matched in more than one root need their copies compared.
-            let mut first_root: HashMap<&str, usize> = HashMap::new();
-            let shared: HashSet<&str> = merged
-                .iter()
-                .filter(|(root, m)| *first_root.entry(&m.session_id).or_insert(*root) != *root)
-                .map(|(_, m)| m.session_id.as_str())
-                .collect();
-            let mut copies: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
-            for (root, m) in merged
-                .iter()
-                .filter(|(_, m)| shared.contains(m.session_id.as_str()))
-            {
-                let len = m
-                    .session_file
-                    .as_ref()
-                    .and_then(|f| fs::metadata(f).ok())
-                    .map_or(0, |md| md.len());
-                copies
-                    .entry(m.session_id.clone())
-                    .or_default()
-                    .push((*root, len));
-            }
-            let owners = owners_of(copies);
-            merged.retain(|(root, m)| owners.get(&m.session_id).is_none_or(|owner| owner == root));
             // Each root sorted its own results; re-sort so the merged list is
             // ranked globally rather than grouped by which root it came from.
             merged.sort_by(|(_, a), (_, b)| {
@@ -2168,7 +2164,16 @@ fn main() {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| b.modified.cmp(&a.modified))
             });
-            let mut matches = dedupe_sessions_across_roots(merged, |m| &m.session_id);
+            let mut matches: Vec<IndexMatch> = pick_session_hits(
+                merged,
+                |m| &m.session_id,
+                &owners,
+                &resume_dirs,
+                |m, dir| m.config_dir = dir,
+            )
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
             // Titles live in the transcripts, so only read them for displayed results
             for m in matches.iter_mut().take(cli.limit) {
                 if let Some(path) = &m.session_file {

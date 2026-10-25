@@ -545,6 +545,78 @@ mod multi_config_root {
             "{stdout}"
         );
     }
+
+    #[test]
+    fn a_match_only_in_a_shorter_copy_is_still_shown_and_resumes_the_owner() {
+        ensure_binary_built();
+        // The copies diverged: only the shorter ~/.claude copy mentions the
+        // query, the longer ~/.claude.bak copy doesn't. The match must not be
+        // dropped just because the other root owns the session.
+        let home = tempfile::tempdir().expect("tempdir");
+        let id = "abababab-abab-abab-abab-abababababab";
+        write_session(
+            &home.path().join(".claude"),
+            "-home-user-forked",
+            id,
+            "forked transcript about zebrafish migration",
+        );
+        write_session(
+            &home.path().join(".claude.bak"),
+            "-home-user-forked",
+            id,
+            "a much longer transcript that went on to talk about something else",
+        );
+
+        let stdout = search(home.path(), &["zebrafish", "--deep"]);
+
+        assert_eq!(hits_for(&stdout, id), 1, "{stdout}");
+        assert!(
+            resume_for(&stdout, id).contains("CLAUDE_CONFIG_DIR=$HOME/.claude.bak claude -r "),
+            "resume must target the owning (longer) copy:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn an_index_hit_found_only_in_a_backup_resumes_the_live_copy() {
+        ensure_binary_built();
+        // Only the backup's frozen index still mentions the query; the live
+        // session has since moved on and grown.
+        let home = tempfile::tempdir().expect("tempdir");
+        let id = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd";
+        write_index(
+            &home.path().join(".claude.bak"),
+            "-home-user-moved",
+            id,
+            "axolotl tank setup",
+        );
+        write_session(
+            &home.path().join(".claude.bak"),
+            "-home-user-moved",
+            id,
+            "short",
+        );
+        write_index(
+            &home.path().join(".claude"),
+            "-home-user-moved",
+            id,
+            "aquarium lighting",
+        );
+        write_session(
+            &home.path().join(".claude"),
+            "-home-user-moved",
+            id,
+            "a longer live transcript that kept going",
+        );
+
+        let stdout = search(home.path(), &["axolotl"]);
+
+        assert_eq!(hits_for(&stdout, id), 1, "{stdout}");
+        let resume = resume_for(&stdout, id);
+        assert!(
+            !resume.contains("CLAUDE_CONFIG_DIR"),
+            "resume must continue the live ~/.claude copy, got: {resume}"
+        );
+    }
 }
 
 mod index_parsing {
