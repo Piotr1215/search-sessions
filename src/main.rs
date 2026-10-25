@@ -294,17 +294,22 @@ fn session_owner(copies: &[(usize, u64)]) -> Option<usize> {
 /// backup's. A session with a single transcript is owned by its root even
 /// if another root's stale index still lists it. Only sessions found in
 /// more than one root are stat'ed.
-fn session_owners(bases: &[PathBuf]) -> HashMap<String, usize> {
+fn session_owners(bases: &[PathBuf], project_filter: Option<&str>) -> HashMap<String, usize> {
     if bases.len() < 2 {
         return HashMap::new();
     }
     let mut copies: HashMap<String, Vec<(usize, PathBuf)>> = HashMap::new();
     for (root, base) in bases.iter().enumerate() {
-        let Ok(projects) = fs::read_dir(base) else {
-            continue;
+        // Only the project dirs this search will read; a copied root keeps
+        // the same project dir names, so copies are still found.
+        let projects: Vec<PathBuf> = match project_filter {
+            Some(_) => resolve_search_paths(base, project_filter),
+            None => fs::read_dir(base)
+                .map(|entries| entries.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default(),
         };
-        for project in projects.flatten() {
-            let Ok(files) = fs::read_dir(project.path()) else {
+        for project in projects {
+            let Ok(files) = fs::read_dir(&project) else {
                 continue;
             };
             for file in files.flatten() {
@@ -2205,7 +2210,7 @@ fn main() {
             bases.iter().map(|base| resume_config_dir(base)).collect();
 
         if cli.deep {
-            let owners = session_owners(&bases);
+            let owners = session_owners(&bases, project_filter);
             if let Some(filter) = project_filter
                 && bases
                     .iter()
