@@ -852,25 +852,231 @@ mod multi_config_root {
             "{stdout}"
         );
     }
+}
+
+/// `--format jsonl` is a public schema: each row names the mode that produced
+/// it (`kind`) and where its record lives, so a caller can open or resume it
+/// without searching again.
+mod jsonl_output {
+    use super::*;
+    use std::path::Path;
+    use std::process::Stdio;
+
+    const PERSONAL: &str = "11111111-1111-1111-1111-111111111111";
+    const WORK: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn record(session: &str, kind: &str, uuid: Option<&str>, text: &str) -> String {
+        let mut record = serde_json::json!({
+            "type": kind,
+            "sessionId": session,
+            "cwd": "/home/user/app",
+            "timestamp": "2026-02-01T10:00:00Z",
+            "message": {"role": kind, "content": [{"type": "text", "text": text}]},
+        });
+        if let Some(uuid) = uuid {
+            record["uuid"] = uuid.into();
+        }
+        format!("{record}\n")
+    }
+
+    /// A personal session whose match is on line 3 with a uuid, and a work
+    /// session whose matching record has no uuid
+    fn fake_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("tempdir");
+        let personal = home.path().join(".claude/projects/-home-user-app");
+        fs::create_dir_all(&personal).unwrap();
+        fs::write(
+            personal.join(format!("{PERSONAL}.jsonl")),
+            [
+                record(PERSONAL, "user", Some("u-1"), "set up the tank"),
+                record(PERSONAL, "assistant", Some("u-2"), "the tank is ready"),
+                record(PERSONAL, "user", Some("u-3"), "zebrafish migration plan"),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let work = home.path().join(".claude-work/projects/-home-user-app");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(
+            work.join(format!("{WORK}.jsonl")),
+            record(WORK, "user", None, "zebrafish migration at work"),
+        )
+        .unwrap();
+        home
+    }
+
+    /// Run the binary with `HOME=home`; `path_env` replaces PATH, so an empty
+    /// directory hides ripgrep and forces the Rust fallback
+    fn run(home: &Path, args: &[&str], path_env: Option<&Path>) -> Vec<serde_json::Value> {
+        let mut cmd = Command::new(binary_path());
+        cmd.args(args)
+            .args(["--format", "jsonl"])
+            .env("HOME", home)
+            .env_remove("CLAUDE_CONFIG_DIR");
+        if let Some(path) = path_env {
+            cmd.env("PATH", path);
+        }
+        let output = cmd.output().expect("Failed to run binary");
+        assert!(output.status.success(), "binary failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line must be one JSON object"))
+            .collect()
+    }
+
+    fn row_for<'a>(rows: &'a [serde_json::Value], session: &str) -> &'a serde_json::Value {
+        rows.iter()
+            .find(|row| row["session_id"] == session)
+            .unwrap_or_else(|| panic!("no row for {session}: {rows:?}"))
+    }
+
+    fn path_str(path: PathBuf) -> String {
+        path.to_string_lossy().into_owned()
+    }
 
     #[test]
-    fn jsonl_deep_search_exposes_exact_source_provenance() {
+    fn deep_row_names_the_exact_record_with_and_without_ripgrep() {
         ensure_binary_built();
         let home = fake_home();
-        let stdout = search(
-            home.path(),
-            &["zebrafish", "--deep", "--format", "jsonl", "--limit", "1"],
-        );
-        let row: serde_json::Value = serde_json::from_str(stdout.trim())
-            .expect("--format jsonl must emit one JSON object per result");
+        let no_rg = tempfile::tempdir().expect("tempdir");
+        let args = ["zebrafish", "--deep"];
 
-        assert_eq!(row["session_id"], "11111111-1111-1111-1111-111111111111");
-        assert_eq!(row["record_line"], 1);
-        assert_eq!(row["message_type"], "user");
-        assert!(row["transcript_path"].as_str().unwrap().ends_with(
-            ".claude/projects/-home-user-personal/11111111-1111-1111-1111-111111111111.jsonl"
-        ));
-        assert!(row["config_root"].as_str().unwrap().ends_with(".claude"));
+        let with_rg = run(home.path(), &args, None);
+        let without_rg = run(home.path(), &args, Some(no_rg.path()));
+
+        for rows in [&with_rg, &without_rg] {
+            let row = row_for(rows, PERSONAL);
+            assert_eq!(row["kind"], "deep");
+            assert_eq!(row["record_line"], 3, "{row}");
+            assert_eq!(row["record_uuid"], "u-3", "{row}");
+            assert_eq!(row["message_type"], "user");
+            assert_eq!(
+                row["transcript_path"],
+                path_str(
+                    home.path()
+                        .join(format!(".claude/projects/-home-user-app/{PERSONAL}.jsonl"))
+                )
+            );
+            assert_eq!(row["config_root"], path_str(home.path().join(".claude")));
+            assert!(row.get("sessions_root").is_none(), "{row}");
+        }
+    }
+
+    #[test]
+    fn deep_row_names_its_own_config_root_and_a_null_uuid_when_absent() {
+        ensure_binary_built();
+        let home = fake_home();
+        let rows = run(home.path(), &["zebrafish", "--deep"], None);
+
+        let row = row_for(&rows, WORK);
+        assert_eq!(
+            row["config_root"],
+            path_str(home.path().join(".claude-work"))
+        );
+        assert!(row["record_uuid"].is_null(), "{row}");
+    }
+
+    #[test]
+    fn index_row_names_its_config_root_and_transcript_and_keeps_the_full_prompt() {
+        ensure_binary_built();
+        let home = fake_home();
+        let prompt = format!("zebrafish {}", "x".repeat(300));
+        fs::write(
+            home.path()
+                .join(".claude-work/projects/-home-user-app/sessions-index.json"),
+            serde_json::json!({
+                "originalPath": "/home/user/app",
+                "entries": [{
+                    "sessionId": WORK,
+                    "firstPrompt": prompt,
+                    "summary": "zebrafish plan",
+                    "messageCount": 1,
+                    "created": "2026-02-01T10:00:00Z",
+                    "modified": "2026-02-01T10:00:00Z",
+                    "projectPath": "/home/user/app",
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let rows = run(home.path(), &["zebrafish"], None);
+
+        let row = row_for(&rows, WORK);
+        assert_eq!(row["kind"], "index");
+        assert_eq!(
+            row["config_root"],
+            path_str(home.path().join(".claude-work"))
+        );
+        assert_eq!(
+            row["transcript_path"],
+            path_str(
+                home.path()
+                    .join(format!(".claude-work/projects/-home-user-app/{WORK}.jsonl"))
+            )
+        );
+        assert_eq!(row["first_prompt"], prompt, "JSON output must not truncate");
+        assert!(row.get("config_dir").is_none(), "{row}");
+    }
+
+    #[test]
+    fn openclaw_row_names_its_sessions_root() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        let sessions = home.path().join(".openclaw/agents/main/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::copy(
+            fixtures_dir().join("openclaw-session.jsonl"),
+            sessions.join("test-openclaw-1.jsonl"),
+        )
+        .unwrap();
+
+        let rows = run(home.path(), &["configure", "--openclaw"], None);
+
+        let row = row_for(&rows, "test-openclaw-1");
+        assert_eq!(row["kind"], "openclaw");
+        assert_eq!(row["sessions_root"], path_str(sessions));
+        assert!(row.get("config_root").is_none(), "{row}");
+        assert_eq!(row["record_line"], 2);
+        assert!(row["record_uuid"].is_null(), "{row}");
+    }
+
+    #[test]
+    fn obsidian_row_names_the_file_and_line() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        let vault = fixtures_dir().join("obsidian-vault");
+
+        let rows = run(
+            home.path(),
+            &["RBAC", "--obsidian", vault.to_str().unwrap()],
+            None,
+        );
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["kind"], "obsidian");
+        assert_eq!(rows[0]["file_path"], path_str(vault.join("Projects.md")));
+        assert_eq!(rows[0]["line_number"], 15);
+    }
+
+    #[test]
+    fn a_reader_closing_the_pipe_early_is_not_a_crash() {
+        ensure_binary_built();
+        let home = fake_home();
+        let mut child = Command::new(binary_path())
+            .args(["zebrafish", "--deep", "--format", "jsonl"])
+            .env("HOME", home.path())
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to run binary");
+        // Close the read end before the first row is written, like `| head -0`
+        drop(child.stdout.take());
+        let output = child.wait_with_output().expect("wait");
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
     }
 }
 

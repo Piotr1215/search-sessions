@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -87,9 +87,13 @@ struct IndexMatch {
     message_count: u64,
     matched_field: String,
     score: f64,
+    #[serde(rename = "transcript_path", serialize_with = "lossy_path")]
     session_file: Option<PathBuf>,
     custom_title: Option<String>,
+    /// Claude config dir the session resumes in
+    config_root: String,
     /// Set when the session lives outside the root `claude` reads by default
+    #[serde(skip)]
     config_dir: Option<PathBuf>,
 }
 
@@ -104,11 +108,18 @@ struct DeepMatch {
     first_prompt: Option<String>,
     custom_title: Option<String>,
     /// Set when the session lives outside the root `claude` reads by default
+    #[serde(skip)]
     config_dir: Option<PathBuf>,
+    /// Transcript holding the matched record
     transcript_path: String,
-    config_root: String,
+    /// Claude config dir the session resumes in (Claude Code hits only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_root: Option<String>,
+    /// OpenClaw sessions dir searched (OpenClaw hits only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions_root: Option<String>,
     record_line: usize,
-    record_uuid: String,
+    record_uuid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -760,7 +771,7 @@ fn search_index(
                     } else {
                         entry.project_path.clone()
                     },
-                    first_prompt: truncate(&entry.first_prompt, MAX_SNIPPET_LEN),
+                    first_prompt: entry.first_prompt.clone(),
                     summary: entry.summary.clone(),
                     git_branch: entry.git_branch.clone(),
                     created: entry.created.clone(),
@@ -770,6 +781,7 @@ fn search_index(
                     score,
                     session_file: index_session_file(&index_path, &entry.session_id),
                     custom_title: None,
+                    config_root: config_root_for_projects(base),
                     config_dir: None,
                 });
             }
@@ -1028,13 +1040,17 @@ fn config_root_for_projects(base: &Path) -> String {
     base.parent().unwrap_or(base).to_string_lossy().into_owned()
 }
 
-fn record_uuid(record: &serde_json::Value) -> String {
+fn record_uuid(record: &serde_json::Value) -> Option<String> {
     record
         .get("uuid")
-        .or_else(|| record.get("id"))
         .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_string()
+        .map(String::from)
+}
+
+/// A path as a JSON string, lossily like the other path fields, so one
+/// non-UTF-8 name can't fail the whole row
+fn lossy_path<S: serde::Serializer>(path: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+    path.as_deref().map(Path::to_string_lossy).serialize(s)
 }
 
 /// Extract session ID from file path (OpenClaw: filename is session ID)
@@ -1355,11 +1371,12 @@ fn search_deep_claude_rust(
                 snippet,
                 timestamp,
                 summary: index_entry.map(|e| e.summary.clone()),
-                first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+                first_prompt: index_entry.map(|e| e.first_prompt.clone()),
                 custom_title: cached_custom_title(&mut titles, &file_path),
                 config_dir: None,
                 transcript_path: file_path.to_string_lossy().into_owned(),
-                config_root: config_root_for_projects(base),
+                config_root: Some(config_root_for_projects(base)),
+                sessions_root: None,
                 record_line: line_index + 1,
                 record_uuid: record_uuid(&record),
             });
@@ -1469,7 +1486,8 @@ fn search_deep_openclaw_rust(
                 custom_title: None,
                 config_dir: None,
                 transcript_path: file_path.to_string_lossy().into_owned(),
-                config_root: base.to_string_lossy().into_owned(),
+                config_root: None,
+                sessions_root: Some(base.to_string_lossy().into_owned()),
                 record_line: line_index + 1,
                 record_uuid: record_uuid(&record),
             });
@@ -1644,11 +1662,12 @@ fn search_deep_claude(
             snippet,
             timestamp,
             summary: index_entry.map(|e| e.summary.clone()),
-            first_prompt: index_entry.map(|e| truncate(&e.first_prompt, 120)),
+            first_prompt: index_entry.map(|e| e.first_prompt.clone()),
             custom_title: cached_custom_title(&mut titles, &path),
             config_dir: None,
             transcript_path: path.to_string_lossy().into_owned(),
-            config_root: config_root_for_projects(base),
+            config_root: Some(config_root_for_projects(base)),
+            sessions_root: None,
             record_line,
             record_uuid: record_uuid(&record),
         });
@@ -1790,7 +1809,8 @@ fn search_deep_openclaw(
             custom_title: None,
             config_dir: None,
             transcript_path: path.to_string_lossy().into_owned(),
-            config_root: base.to_string_lossy().into_owned(),
+            config_root: None,
+            sessions_root: Some(base.to_string_lossy().into_owned()),
             record_line,
             record_uuid: record_uuid(&record),
         });
@@ -2067,14 +2087,32 @@ fn print_index_results(matches: &[IndexMatch], query: &str, limit: usize) {
     println!("{sep}\n");
 }
 
-fn print_jsonl<T: Serialize>(matches: &[T], limit: usize) {
-    for item in matches.iter().take(limit) {
-        match serde_json::to_string(item) {
-            Ok(line) => println!("{line}"),
+/// One `--format jsonl` row: a result's fields plus `kind`, the mode that
+/// produced it, which tells a consumer which fields to expect
+#[derive(Serialize)]
+struct JsonlRow<'a, T> {
+    kind: &'static str,
+    #[serde(flatten)]
+    result: &'a T,
+}
+
+fn print_jsonl<T: Serialize>(kind: &'static str, matches: &[T], limit: usize) {
+    let mut out = std::io::stdout().lock();
+    for result in matches.iter().take(limit) {
+        let line = match serde_json::to_string(&JsonlRow { kind, result }) {
+            Ok(line) => line,
             Err(error) => {
                 eprintln!("ERROR: failed to serialize search result: {error}");
                 std::process::exit(1);
             }
+        };
+        if let Err(error) = writeln!(out, "{line}").and_then(|()| out.flush()) {
+            // The reader closed the pipe (`| head -1`): it has what it wanted
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(0);
+            }
+            eprintln!("ERROR: failed to write search result: {error}");
+            std::process::exit(1);
         }
     }
 }
@@ -2116,8 +2154,14 @@ fn print_deep_results(matches: &[DeepMatch], query: &str, limit: usize, is_openc
             .summary
             .as_deref()
             .filter(|s| !s.is_empty())
-            .or(m.first_prompt.as_deref().filter(|s| !s.is_empty()))
-            .unwrap_or("(no summary)");
+            .map(String::from)
+            .or_else(|| {
+                m.first_prompt
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|p| truncate(p, 120))
+            })
+            .unwrap_or_else(|| "(no summary)".to_string());
 
         println!("  [{}] [{}] {}", i + 1, role, label);
         if let Some(ref title) = m.custom_title {
@@ -2218,7 +2262,7 @@ fn main() {
 
         let matches = search_obsidian(&query, cli.limit, vault_path);
         if matches!(cli.format, OutputFormat::Jsonl) {
-            print_jsonl(&matches, cli.limit);
+            print_jsonl("obsidian", &matches, cli.limit);
         } else {
             print_obsidian_results(&matches, &query, cli.limit, vault_path);
         }
@@ -2241,7 +2285,7 @@ fn main() {
 
         let matches = search_deep_openclaw(&query, cli.limit, &base, &date_range);
         if matches!(cli.format, OutputFormat::Jsonl) {
-            print_jsonl(&matches, cli.limit);
+            print_jsonl("openclaw", &matches, cli.limit);
         } else {
             print_deep_results(&matches, &query, cli.limit, true);
         }
@@ -2306,6 +2350,7 @@ fn main() {
                 &owners,
                 |m, _, owner| {
                     m.config_dir.clone_from(&resume_dirs[owner]);
+                    m.config_root = Some(config_root_for_projects(&bases[owner]));
                 },
             ) {
                 match owners.get(&hit.session_id) {
@@ -2340,7 +2385,7 @@ fn main() {
                 }
             }
             if matches!(cli.format, OutputFormat::Jsonl) {
-                print_jsonl(&matches, cli.limit);
+                print_jsonl("deep", &matches, cli.limit);
             } else {
                 print_deep_results(&matches, &query, cli.limit, false);
             }
@@ -2368,6 +2413,7 @@ fn main() {
                 &owners,
                 |m, root, owner| {
                     m.config_dir.clone_from(&resume_dirs[owner]);
+                    m.config_root = config_root_for_projects(&bases[owner]);
                     // Read the custom title from the owner's transcript
                     if owner != root
                         && let Some(file) = &m.session_file
@@ -2382,12 +2428,14 @@ fn main() {
             .collect();
             // Titles live in the transcripts, so only read them for displayed results
             for m in matches.iter_mut().take(cli.limit) {
+                // An index can list a session whose transcript is gone
+                m.session_file = m.session_file.take().filter(|path| path.is_file());
                 if let Some(path) = &m.session_file {
                     m.custom_title = read_custom_title(path);
                 }
             }
             if matches!(cli.format, OutputFormat::Jsonl) {
-                print_jsonl(&matches, cli.limit);
+                print_jsonl("index", &matches, cli.limit);
             } else {
                 print_index_results(&matches, &query, cli.limit);
             }
