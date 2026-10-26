@@ -35,7 +35,7 @@ struct Cli {
     openclaw: bool,
 
     /// Search Codex sessions (every ~/.codex*/sessions and $CODEX_HOME) instead of Claude Code
-    #[arg(long, conflicts_with = "openclaw")]
+    #[arg(long, conflicts_with_all = ["openclaw", "obsidian"])]
     codex: bool,
 
     /// Search an Obsidian vault directory
@@ -1898,14 +1898,36 @@ fn search_deep_openclaw(
 
 // ─── Codex Search ───────────────────────────────────────────────────
 
+/// How each piece of text Codex itself injects as user input begins, from
+/// the matchers in codex-rs/core/src/context/contextual_user_message.rs,
+/// plus `<user_instructions>`, which older rollouts used for AGENTS.md, and
+/// the labels Codex wraps around an attached image. Anything else a user
+/// item holds was typed or pasted, even when it starts with `<`.
+const CODEX_INJECTED_PREFIXES: &[&str] = &[
+    "# AGENTS.md instructions",
+    "<user_instructions>",
+    "<environment_context>",
+    "<skill>",
+    "<user_shell_command>",
+    "<turn_aborted>",
+    "<subagent_notification>",
+    "<agent_message_board_notification>",
+    "<codex_internal_context",
+    "<goal_context>",
+    "<recommended_plugins>",
+    "<hook_prompt",
+    "<image name=",
+    "<image>",
+    "</image>",
+];
+
 /// Text of a Codex conversation turn, or None for any other record.
 ///
 /// Turns are `response_item` records whose payload is a user or assistant
 /// `message`. Developer messages and the harness text Codex injects as user
-/// items (AGENTS.md instructions, `<environment_context>`, `<skill>` bodies)
-/// are dropped, so a hit is something a person typed
-/// or the model answered. The `event_msg` copy of each prompt is ignored so a
-/// prompt is not counted twice.
+/// items (CODEX_INJECTED_PREFIXES) are dropped, so a hit is something a
+/// person typed or the model answered. The `event_msg` copy of each prompt
+/// is ignored so a prompt is not counted twice.
 fn extract_text_codex(record: &serde_json::Value) -> Option<(String, String)> {
     if record.get("type").and_then(|t| t.as_str()) != Some("response_item") {
         return None;
@@ -1930,7 +1952,11 @@ fn extract_text_codex(record: &serde_json::Value) -> Option<(String, String)> {
         })
         .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
         .filter(|text| {
-            role != "user" || !(text.starts_with('<') || text.starts_with("# AGENTS.md"))
+            let text = text.trim_start();
+            role != "user"
+                || !CODEX_INJECTED_PREFIXES
+                    .iter()
+                    .any(|prefix| text.starts_with(prefix))
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -1984,6 +2010,17 @@ fn load_codex_thread_names(codex_home: &Path) -> HashMap<String, String> {
         }
     }
     names
+}
+
+/// The query term to hand ripgrep as a fixed string, or None to scan every
+/// rollout. A hit must contain every term, so one term is enough to find
+/// all candidate lines; the longest is usually the rarest. ripgrep reads the
+/// raw JSON line, so the term is JSON-escaped (a `"` in it is `\"` there).
+/// `CodexScan::consider` still checks every term against the parsed text.
+fn codex_prefilter_term(query: &str) -> Option<String> {
+    let term = query.split_whitespace().max_by_key(|term| term.len())?;
+    let escaped = serde_json::to_string(term).ok()?;
+    Some(escaped[1..escaped.len() - 1].to_string())
 }
 
 /// Codex session id when session_meta is unreadable: the UUID that ends
@@ -2101,7 +2138,9 @@ impl<'a> CodexScan<'a> {
 /// Deep search one Codex sessions/ root, newest rollout first.
 ///
 /// Rollouts live at YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl, so reverse
-/// path order is reverse chronological and `limit` keeps the newest hits.
+/// path order is reverse chronological by thread start, and `limit` keeps
+/// the hits from the most recently started threads, not the most recent
+/// messages.
 fn search_deep_codex(
     query: &str,
     limit: usize,
@@ -2112,37 +2151,52 @@ fn search_deep_codex(
     let mut scan = CodexScan::new(query, project_filter, sessions_dir, date_range);
     let mut matches = Vec::new();
 
-    let rg_output = if is_ripgrep_available() {
-        // --no-ignore: ~/.codex is commonly a git repo whose .gitignore is `*`
-        // (config versioned, transcripts not), and ripgrep would honour it
-        // and skip every rollout.
-        Command::new("rg")
-            .args([
-                "--no-heading",
-                "--line-number",
-                "--ignore-case",
-                "--no-ignore",
-                "--sortr=path",
-                "--glob",
-                "*.jsonl",
-                query,
-            ])
-            .arg(sessions_dir)
-            .output()
-            .map_err(|e| eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback."))
-            .ok()
-    } else {
-        warn_ripgrep_not_available();
-        None
+    let rg_output = match codex_prefilter_term(query) {
+        Some(term) if is_ripgrep_available() => {
+            // --no-ignore: ~/.codex is commonly a git repo whose .gitignore is
+            // `*` (config versioned, transcripts not), and ripgrep would
+            // honour it and skip every rollout. --text: a rollout can hold a
+            // stray NUL byte, and ripgrep stops reading a file it takes for
+            // binary there, dropping every later hit the fallback finds.
+            Command::new("rg")
+                .args([
+                    "--no-heading",
+                    "--line-number",
+                    "--ignore-case",
+                    "--no-ignore",
+                    "--text",
+                    "--sortr=path",
+                    "--glob",
+                    "*.jsonl",
+                    "--fixed-strings",
+                    "-e",
+                    &term,
+                ])
+                .arg(sessions_dir)
+                .output()
+                .map_err(|e| eprintln!("WARNING: Failed to run ripgrep: {e}. Using Rust fallback."))
+                .ok()
+                // Exit 1 is "no matches"; anything else may be a partial
+                // result, so scan without ripgrep instead
+                .filter(|output| match output.status.code() {
+                    Some(0 | 1) => true,
+                    code => {
+                        eprintln!(
+                            "WARNING: ripgrep returned unexpected exit code: {code:?}. Using Rust fallback."
+                        );
+                        false
+                    }
+                })
+        }
+        _ => {
+            if !is_ripgrep_available() {
+                warn_ripgrep_not_available();
+            }
+            None
+        }
     };
 
     if let Some(output) = rg_output {
-        if !output.status.success() && output.status.code() != Some(1) {
-            eprintln!(
-                "WARNING: ripgrep returned unexpected exit code: {:?}",
-                output.status.code()
-            );
-        }
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             if matches.len() >= limit {
                 break;

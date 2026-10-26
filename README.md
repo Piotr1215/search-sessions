@@ -88,7 +88,7 @@ search-sessions "refactor" --since "last week"
 
 **Multiple accounts.** If you keep accounts in separate config roots with `CLAUDE_CONFIG_DIR` (for example `~/.claude` and `~/.claude-work`), every `~/.claude*/projects` directory and `$CLAUDE_CONFIG_DIR/projects` is searched and the results are merged. For a session from a root that `claude` doesn't read by default, the `Resume` command sets `CLAUDE_CONFIG_DIR` for you.
 
-**`--format jsonl`** prints one JSON object per result. `kind` names the shape: `index`, `deep`, `openclaw` or `obsidian`. Claude Code rows carry `config_root`, the config dir to resume the session in, and `transcript_path` (null if an index lists a transcript that is gone). Deep rows also carry `record_line` and `record_uuid` (null when the record has none). OpenClaw rows carry `sessions_root` instead of `config_root`. When the only matching copy of a session is in a backup root, its `transcript_path` points into the backup while `config_root` names the live one.
+**`--format jsonl`** prints one JSON object per result. `kind` names the shape: `index`, `deep`, `codex`, `openclaw` or `obsidian`. Claude Code and Codex rows carry `config_root`, the config dir to resume the session in (`CLAUDE_CONFIG_DIR` or `CODEX_HOME`), and `transcript_path` (null if an index lists a transcript that is gone). Deep and Codex rows also carry `record_line` and `record_uuid` (null when the record has none). OpenClaw rows carry `sessions_root` instead of `config_root`. When the only matching copy of a session is in a backup root, its `transcript_path` points into the backup while `config_root` names the live one.
 
 **`--project` with deep search** searches every project directory whose name matches (a repo and its worktrees). If nothing matches in a config root, that root is skipped; earlier versions fell back to searching the whole root.
 
@@ -121,7 +121,7 @@ No commands to memorize. No context switching.
 
 ## Codex Support
 
-Searches Codex rollouts with `--codex`: every `~/.codex*/sessions` root (personal and work accounts) plus `$CODEX_HOME`, newest first. It matches what you typed and what Codex answered, never the AGENTS.md or environment text Codex injects, and skips subagent threads. Each hit prints a `codex resume` command, with `CODEX_HOME=` set when the session lives outside the default home.
+Searches Codex rollouts with `--codex`: every `~/.codex*/sessions` root (personal and work accounts) plus `$CODEX_HOME`, newest first. It matches what you typed and what Codex answered, never the AGENTS.md or environment text Codex injects, and skips subagent threads. Each hit prints a `codex resume` command, with `CODEX_HOME=` set when the session lives outside the default home. Rollouts are filed by the date a thread started, so `--limit` keeps hits from the most recently started threads: a new message in an older thread can fall outside it.
 
 ```bash
 search-sessions "helm upgrade" --codex

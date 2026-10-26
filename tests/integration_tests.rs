@@ -1128,6 +1128,9 @@ mod codex_sessions {
                 &[
                     "# AGENTS.md instructions\n<INSTRUCTIONS>quokka</INSTRUCTIONS>",
                     "<environment_context>quokka</environment_context>",
+                    "<user_instructions>quokka</user_instructions>",
+                    "<skill>\n<name>quokka</name>\n</skill>",
+                    "<turn_aborted>quokka</turn_aborted>",
                 ],
             ),
             message(&ts, "user", "input_text", &[prompt]),
@@ -1326,17 +1329,128 @@ mod codex_sessions {
         assert_eq!(ids(&String::from_utf8_lossy(&output.stdout)), [PERSONAL]);
     }
 
+    /// Session ids for `query` with ripgrep and with the Rust fallback
+    fn ids_both_ways(home: &Path, query: &str) -> (Vec<String>, Vec<String>) {
+        let no_rg = tempfile::tempdir().expect("tempdir");
+        let args = [query, "--format", "jsonl"];
+        (
+            ids(&run(home, &args, None)),
+            ids(&run(home, &args, Some(no_rg.path()))),
+        )
+    }
+
     #[test]
     fn rust_fallback_returns_what_ripgrep_returns() {
         ensure_binary_built();
         let home = fake_home();
-        let no_rg = tempfile::tempdir().expect("tempdir");
-        let args = ["zebrafish", "--format", "jsonl"];
 
-        let with_rg = run(home.path(), &args, None);
-        let without_rg = run(home.path(), &args, Some(no_rg.path()));
+        let (with_rg, without_rg) = ids_both_ways(home.path(), "zebrafish");
 
-        assert_eq!(ids(&without_rg), ids(&with_rg));
+        assert_eq!(without_rg, with_rg);
+    }
+
+    #[test]
+    fn query_words_need_not_be_adjacent() {
+        ensure_binary_built();
+        let home = fake_home();
+
+        // The prompt is "zebrafish migration personal"
+        let (with_rg, without_rg) = ids_both_ways(home.path(), "zebrafish personal");
+
+        assert_eq!(with_rg, [PERSONAL]);
+        assert_eq!(without_rg, [PERSONAL]);
+    }
+
+    #[test]
+    fn regex_metacharacters_are_searched_literally() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        write_rollout(
+            &home.path().join(".codex"),
+            "10",
+            PERSONAL,
+            home.path(),
+            "user",
+            "why does foo( fail to parse",
+        );
+
+        let (with_rg, without_rg) = ids_both_ways(home.path(), "foo(");
+
+        assert_eq!(with_rg, [PERSONAL]);
+        assert_eq!(without_rg, [PERSONAL]);
+    }
+
+    #[test]
+    fn a_nul_byte_does_not_hide_the_rest_of_a_rollout() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        let codex = home.path().join(".codex");
+        write_rollout(&codex, "10", PERSONAL, home.path(), "user", "zebrafish");
+        let path = codex.join(format!(
+            "sessions/2026/10/10/rollout-2026-10-10T10-00-00-{PERSONAL}.jsonl"
+        ));
+        // A NUL ahead of the prompt makes ripgrep take the file for binary
+        let text = fs::read_to_string(&path).unwrap();
+        let (meta, rest) = text.split_once('\n').unwrap();
+        fs::write(&path, format!("{meta}\n{{\"junk\":\"\0\"}}\n{rest}")).unwrap();
+
+        let (with_rg, without_rg) = ids_both_ways(home.path(), "zebrafish");
+
+        assert_eq!(with_rg, [PERSONAL]);
+        assert_eq!(without_rg, [PERSONAL]);
+    }
+
+    #[test]
+    fn a_typed_prompt_that_starts_with_markup_is_a_hit() {
+        ensure_binary_built();
+        let home = tempfile::tempdir().expect("tempdir");
+        write_rollout(
+            &home.path().join(".codex"),
+            "10",
+            PERSONAL,
+            home.path(),
+            "user",
+            "<div class=\"zebrafish\"> will not center",
+        );
+
+        let stdout = run(home.path(), &["zebrafish", "--format", "jsonl"], None);
+
+        assert_eq!(ids(&stdout), [PERSONAL], "{stdout}");
+    }
+
+    #[test]
+    fn since_and_until_bound_codex_hits() {
+        ensure_binary_built();
+        let home = fake_home();
+
+        let since = run(
+            home.path(),
+            &["zebrafish", "--since", "2026-10-09", "--format", "jsonl"],
+            None,
+        );
+        let until = run(
+            home.path(),
+            &["zebrafish", "--until", "2026-10-09", "--format", "jsonl"],
+            None,
+        );
+
+        assert_eq!(ids(&since), [PERSONAL, WORK], "{since}");
+        assert_eq!(ids(&until), [WORK, OLDER], "{until}");
+    }
+
+    #[test]
+    fn codex_cannot_be_combined_with_obsidian() {
+        ensure_binary_built();
+        let output = Command::new(binary_path())
+            .args(["--codex", "--obsidian", "/tmp", "zebrafish"])
+            .output()
+            .expect("Failed to run binary");
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be used with"),
+            "{output:?}"
+        );
     }
 }
 
